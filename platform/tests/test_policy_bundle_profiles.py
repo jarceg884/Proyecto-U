@@ -25,9 +25,13 @@ def _admin(client, idp):
 
 @pytest.fixture
 def factory_ids(client, idp):
-    resp = client.get("/api/marketplace/profiles", headers=_admin(client, idp))
-    assert resp.status_code == 200, resp.text
-    return {p["factory_key"]: p["id"] for p in resp.json()["profiles"] if p["source"] == "factory"}
+    # The marketplace starts empty (§7.3): the policy tests add the templates they assign.
+    ids = {}
+    for key in ("analyst", "coder", "ops"):
+        resp = client.post(f"/api/marketplace/profiles/templates/{key}", headers=_admin(client, idp))
+        assert resp.status_code == 200, resp.text
+        ids[key] = resp.json()["profile"]["id"]
+    return ids
 
 
 def _body(profiles, default, **overrides):

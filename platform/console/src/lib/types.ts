@@ -953,6 +953,8 @@ export interface MarketplaceProfile {
   description: string;
   source: "factory" | "imported";
   factory_key: string | null;
+  /** Marketplace section the admin groups it in (spec 045 §7.3); null = no section. */
+  section: string | null;
   status: "active" | "archived";
   created_at: string | null;
   updated_at: string | null;
@@ -982,6 +984,26 @@ export interface MarketplaceProfileDetail extends MarketplaceProfile {
 
 export interface MarketplaceList {
   profiles: MarketplaceProfile[];
+}
+
+/** A factory template (Analyst, Coder, Ops): the marketplace starts empty and the admin adds
+ *  the ones they want (spec 045 §7.3). */
+export interface MarketplaceTemplate {
+  key: string;
+  name: string;
+  description: string;
+  summary: MarketplaceSummary;
+  profile: { id: string; slug: string; status: "active" | "archived" } | null;
+}
+
+export interface MarketplaceTemplates {
+  templates: MarketplaceTemplate[];
+}
+
+export interface MarketplaceTemplateResult {
+  profile: MarketplaceProfileDetail;
+  added: boolean;
+  restored: boolean;
 }
 
 export interface MarketplaceImportResult {

@@ -86,63 +86,133 @@ def _free_slug(conn: Connection, wanted: str) -> str:
     raise conflict("No se pudo reservar un nombre para el perfil de fábrica.")
 
 
-def ensure_factory_profiles(conn: Connection, tenant_id: str) -> int:
-    """Idempotent: every tenant's marketplace carries the factory profiles, at their current
-    release. A newer factory package (product release) becomes a new version; an archived
-    factory profile stays archived (the admin decided)."""
-    existing = {
-        r["factory_key"]: dict(r)
+def normalize_section(value: str | None) -> str | None:
+    """A marketplace section (§7.3): free text, single-spaced, 1-60 characters; blank clears it."""
+    if value is None:
+        return None
+    clean = " ".join(value.split())
+    if not clean:
+        return None
+    if len(clean) > 60:
+        raise validation_failed("La sección admite hasta 60 caracteres.", {"rule": "section_too_long"})
+    return clean
+
+
+def _refresh_factory_version(conn: Connection, tenant_id: str, profile_id: str, key: str) -> bool:
+    """A template the tenant added follows the factory package of the running release: a newer
+    package becomes a new version. True when a version was added."""
+    pkg = _factory_package(key)
+    latest = _latest(conn, profile_id)
+    if latest is not None and latest["sha256"] == pkg.sha256:
+        return False  # the common path: no lock taken on a plain list
+    conn.execute(
+        text("SELECT 1 FROM agent_profiles WHERE id = CAST(:p AS uuid) FOR UPDATE"),
+        {"p": profile_id},
+    )
+    latest = _latest(conn, profile_id)  # re-read under the lock
+    if latest is not None and latest["sha256"] == pkg.sha256:
+        return False
+    storage.put(pkg.data, pkg.sha256)
+    version = (latest["version"] if latest else 0) + 1
+    _insert_version(conn, tenant_id, profile_id, version, pkg, None)
+    audit.emit(
+        conn, tenant_id=tenant_id, actor_role="system",
+        action="agent_profile.version_added", target_type="agent_profile",
+        target_id=profile_id,
+        payload={"factory_key": key, "version": version, "sha256": pkg.sha256},
+    )
+    return True
+
+
+def refresh_factory_profiles(conn: Connection, tenant_id: str) -> int:
+    """Brings the templates this tenant ADDED to the factory release (an archived one stays
+    archived). Never adds one: a tenant's marketplace starts empty and the admin adds the
+    templates they want (§7.3). Returns the number of versions added."""
+    keys = {item["key"] for item in factory_catalog()}
+    added = 0
+    rows = conn.execute(
+        text("SELECT id, factory_key FROM agent_profiles WHERE factory_key IS NOT NULL")
+    ).mappings().all()
+    for row in rows:
+        if row["factory_key"] in keys and _refresh_factory_version(
+            conn, tenant_id, str(row["id"]), row["factory_key"]
+        ):
+            added += 1
+    return added
+
+
+def template_catalog(conn: Connection) -> list[dict]:
+    """The factory templates, with what this tenant's marketplace already has of each."""
+    have = {
+        r["factory_key"]: r
         for r in conn.execute(
-            text("SELECT id, factory_key FROM agent_profiles WHERE factory_key IS NOT NULL")
+            text("SELECT id, slug, status, factory_key FROM agent_profiles WHERE factory_key IS NOT NULL")
         ).mappings()
     }
-    seeded = 0
+    templates = []
     for item in factory_catalog():
-        pkg = _factory_package(item["key"])
-        storage.put(pkg.data, pkg.sha256)
-        row = existing.get(item["key"])
-        if row is None:
-            profile_id = conn.execute(
-                text(
-                    "INSERT INTO agent_profiles"
-                    " (tenant_id, slug, name, description, source, factory_key)"
-                    " VALUES (CAST(:t AS uuid), :slug, :name, :desc, 'factory', :key)"
-                    " ON CONFLICT DO NOTHING RETURNING id"
-                ),
-                {
-                    "t": tenant_id, "slug": _free_slug(conn, item["key"]),
-                    "name": item["name"], "desc": item["description"], "key": item["key"],
-                },
-            ).scalar()
-            if profile_id is None:
-                continue  # a concurrent request seeded it first
-            _insert_version(conn, tenant_id, str(profile_id), 1, pkg, None)
-            audit.emit(
-                conn, tenant_id=tenant_id, actor_role="system",
-                action="agent_profile.factory_seeded", target_type="agent_profile",
-                target_id=str(profile_id),
-                payload={"factory_key": item["key"], "sha256": pkg.sha256},
-            )
-            seeded += 1
-            continue
-        latest = _latest(conn, str(row["id"]))
-        if latest is not None and latest["sha256"] == pkg.sha256:
-            continue  # the common path: no lock taken on a plain list
-        conn.execute(
-            text("SELECT 1 FROM agent_profiles WHERE id = CAST(:p AS uuid) FOR UPDATE"),
-            {"p": str(row["id"])},
-        )
-        latest = _latest(conn, str(row["id"]))  # re-read under the lock
-        if latest is None or latest["sha256"] != pkg.sha256:
-            version = (latest["version"] if latest else 0) + 1
-            _insert_version(conn, tenant_id, str(row["id"]), version, pkg, None)
-            audit.emit(
-                conn, tenant_id=tenant_id, actor_role="system",
-                action="agent_profile.version_added", target_type="agent_profile",
-                target_id=str(row["id"]),
-                payload={"factory_key": item["key"], "version": version, "sha256": pkg.sha256},
-            )
-    return seeded
+        manifest = _factory_package(item["key"]).manifest
+        summary = {k: manifest.get(k) for k in _SUMMARY_KEYS}
+        summary["soul_excerpt"] = (manifest.get("soul_excerpt") or "")[:280]
+        row = have.get(item["key"])
+        templates.append({
+            "key": item["key"],
+            "name": item.get("name_es") or item["name"],
+            "description": item.get("description_es") or item["description"],
+            "summary": summary,
+            "profile": (
+                {"id": str(row["id"]), "slug": row["slug"], "status": row["status"]} if row else None
+            ),
+        })
+    return templates
+
+
+def add_template(conn: Connection, principal: Principal, key: str, section: str | None = None) -> dict:
+    """Adds a factory template to the tenant's marketplace; one that was archived is restored."""
+    item = next((i for i in factory_catalog() if i["key"] == key), None)
+    if item is None:
+        raise not_found("Plantilla no encontrada.")
+    section = normalize_section(section)
+    row = conn.execute(
+        text("SELECT id, status FROM agent_profiles WHERE factory_key = :k FOR UPDATE"), {"k": key}
+    ).mappings().first()
+    if row is not None:
+        profile_id = str(row["id"])
+        _refresh_factory_version(conn, principal.tenant_id, profile_id, key)
+        restored = row["status"] == "archived"
+        if restored:
+            _set_status(conn, principal, profile_id, "active", "agent_profile.restored", {"factory_key": key})
+        return {"profile": get_profile(conn, profile_id), "added": restored, "restored": restored}
+    pkg = _factory_package(key)
+    storage.put(pkg.data, pkg.sha256)
+    profile_id = conn.execute(
+        text(
+            "INSERT INTO agent_profiles"
+            " (tenant_id, slug, name, description, source, factory_key, section, created_by)"
+            " VALUES (CAST(:t AS uuid), :slug, :name, :desc, 'factory', :key, :section, CAST(:by AS uuid))"
+            " ON CONFLICT DO NOTHING RETURNING id"
+        ),
+        {
+            "t": principal.tenant_id, "slug": _free_slug(conn, key),
+            "name": item.get("name_es") or item["name"],
+            "desc": item.get("description_es") or item["description"],
+            "key": key, "section": section, "by": principal.user_id,
+        },
+    ).scalar()
+    if profile_id is None:  # a concurrent request added it first
+        existing = conn.execute(
+            text("SELECT id FROM agent_profiles WHERE factory_key = :k"), {"k": key}
+        ).scalar()
+        return {"profile": get_profile(conn, str(existing)), "added": False, "restored": False}
+    profile_id = str(profile_id)
+    _insert_version(conn, principal.tenant_id, profile_id, 1, pkg, principal.user_id)
+    audit.emit(
+        conn, tenant_id=principal.tenant_id, actor_role=_role(principal),
+        action="agent_profile.template_added", actor_id=principal.user_id,
+        target_type="agent_profile", target_id=profile_id,
+        payload={"factory_key": key, "sha256": pkg.sha256, "section": section},
+    )
+    return {"profile": get_profile(conn, profile_id), "added": True, "restored": False}
 
 
 # --- Import (D-045-02) ---------------------------------------------------------------------------
@@ -151,13 +221,14 @@ def _display_name(slug: str) -> str:
 
 
 def import_package(
-    conn: Connection, principal: Principal, data: bytes, slug_override: str | None = None
+    conn: Connection, principal: Principal, data: bytes, slug_override: str | None = None,
+    section: str | None = None,
 ) -> dict:
     try:
         pkg = sanitize_archive(data, slug_override=slug_override)
     except ArchiveRejected as exc:
         raise validation_failed(exc.message, {"rule": exc.rule}) from None
-    ensure_factory_profiles(conn, principal.tenant_id)  # factory slugs are reserved first
+    section = normalize_section(section)
     row = conn.execute(
         text(
             "SELECT id, source, status FROM agent_profiles WHERE slug = :s FOR UPDATE"
@@ -173,13 +244,13 @@ def import_package(
         description = (distribution.get("description") or meta.get("description") or "")[:1000]
         profile_id = str(conn.execute(
             text(
-                "INSERT INTO agent_profiles (tenant_id, slug, name, description, source, created_by)"
-                " VALUES (CAST(:t AS uuid), :slug, :name, :desc, 'imported', CAST(:by AS uuid))"
+                "INSERT INTO agent_profiles (tenant_id, slug, name, description, source, section, created_by)"
+                " VALUES (CAST(:t AS uuid), :slug, :name, :desc, 'imported', :section, CAST(:by AS uuid))"
                 " RETURNING id"
             ),
             {
                 "t": principal.tenant_id, "slug": pkg.slug, "name": name,
-                "desc": description, "by": principal.user_id,
+                "desc": description, "section": section, "by": principal.user_id,
             },
         ).scalar())
         _insert_version(conn, principal.tenant_id, profile_id, 1, pkg, principal.user_id)
@@ -252,6 +323,7 @@ def _profile_dict(row: Any, usage: dict[str, list[dict]], full: bool) -> dict:
         "description": row["description"],
         "source": row["source"],
         "factory_key": row["factory_key"],
+        "section": row["section"],
         "status": row["status"],
         "created_at": row["created_at"].isoformat() if row["created_at"] else None,
         "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
@@ -271,7 +343,7 @@ def _profile_dict(row: Any, usage: dict[str, list[dict]], full: bool) -> dict:
 
 
 _PROFILE_SQL = (
-    "SELECT p.id, p.slug, p.name, p.description, p.source, p.factory_key, p.status,"
+    "SELECT p.id, p.slug, p.name, p.description, p.source, p.factory_key, p.section, p.status,"
     " p.created_at, p.updated_at, v.version, v.sha256, v.size, v.manifest, v.imported_at,"
     " u.email AS imported_by_email"
     " FROM agent_profiles p"
@@ -344,9 +416,11 @@ def package_path(conn: Connection, profile_id: str, version: int | None = None) 
 def update_profile(
     conn: Connection, principal: Principal, profile_id: str,
     name: str | None, description: str | None,
+    section: str | None = None, set_section: bool = False,
 ) -> dict:
+    """``set_section``: the request carried a section — blank clears it."""
     profile_id = require_uuid(profile_id, "profile_id")
-    fields: dict[str, str] = {}
+    fields: dict[str, str | None] = {}
     if name is not None:
         name = name.strip()
         if not name or len(name) > 120:
@@ -356,6 +430,8 @@ def update_profile(
         if len(description) > 1000:
             raise validation_failed("La descripción admite hasta 1000 caracteres.")
         fields["description"] = description.strip()
+    if set_section:
+        fields["section"] = normalize_section(section)
     if not fields:
         return get_profile(conn, profile_id)
     sets = ", ".join(f"{k} = :{k}" for k in fields)

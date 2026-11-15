@@ -294,18 +294,76 @@ def _db_rows(sql: str, **params):
         return conn.execute(text(sql), params).mappings().all()
 
 
-def test_marketplace_lists_factory_profiles_once(client, idp):
+def _add_template(client, headers, key: str, **body) -> dict:
+    resp = client.post(f"/api/marketplace/profiles/templates/{key}", json=body or None, headers=headers)
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def test_marketplace_starts_empty_and_templates_are_added_by_the_admin(client, idp):
+    """§7.3 (0.7.2): listing never adds the factory profiles — they are templates the admin adds;
+    adding one twice is a no-op and adding an archived one restores it."""
     admin = _h(client, idp)
-    first = client.get("/api/marketplace/profiles", headers=admin)
-    resp = client.get("/api/marketplace/profiles", headers=admin)
-    assert first.status_code == 200 and resp.status_code == 200, resp.text
-    factory = [p for p in resp.json()["profiles"] if p["source"] == "factory"]
-    assert sorted(p["factory_key"] for p in factory) == ["analyst", "coder", "ops"]
-    assert all(p["latest"]["version"] == 1 and len(p["latest"]["summary"]["skills"]) == 4 for p in factory)
-    rows = _db_rows("SELECT count(*) AS n FROM agent_profiles WHERE source = 'factory'")
-    assert rows[0]["n"] == 3
-    seeded = _db_rows("SELECT count(*) AS n FROM audit_log WHERE action = 'agent_profile.factory_seeded'")
-    assert seeded[0]["n"] == 3
+
+    def factory_state():
+        rows = _db_rows("SELECT factory_key, status FROM agent_profiles WHERE source = 'factory' ORDER BY 1")
+        return [(r["factory_key"], r["status"]) for r in rows]
+
+    before = factory_state()
+    for _ in range(2):
+        assert client.get("/api/marketplace/profiles", headers=admin).status_code == 200
+    assert factory_state() == before  # a plain list neither seeds nor re-activates templates
+
+    catalog = client.get("/api/marketplace/profiles/templates", headers=admin)
+    assert catalog.status_code == 200, catalog.text
+    templates = {t["key"]: t for t in catalog.json()["templates"]}
+    assert sorted(templates) == ["analyst", "coder", "ops"]
+    assert templates["analyst"]["name"] == "Analista" and len(templates["analyst"]["summary"]["skills"]) == 4
+
+    added = _add_template(client, admin, "coder")
+    profile = added["profile"]
+    assert profile["source"] == "factory" and profile["factory_key"] == "coder" and profile["status"] == "active"
+    again = _add_template(client, admin, "coder")
+    assert again["added"] is False and again["profile"]["id"] == profile["id"]
+
+    archived = client.post(f"/api/marketplace/profiles/{profile['id']}/archive", json={"confirm": True}, headers=admin)
+    assert archived.status_code == 200, archived.text
+    listed = client.get("/api/marketplace/profiles?include_archived=true", headers=admin).json()["profiles"]
+    assert next(p for p in listed if p["id"] == profile["id"])["status"] == "archived"
+    restored = _add_template(client, admin, "coder")
+    assert restored["restored"] is True and restored["profile"]["status"] == "active"
+    assert _db_rows("SELECT count(*) AS n FROM agent_profiles WHERE factory_key = 'coder'")[0]["n"] == 1
+
+    assert client.post("/api/marketplace/profiles/templates/nope", headers=admin).status_code == 404
+    dept = _h(client, idp, "bob")
+    if client.get("/api/marketplace/profiles/templates", headers=dept).status_code == 200:
+        assert client.post("/api/marketplace/profiles/templates/ops", headers=dept).status_code == 403
+
+
+def test_marketplace_sections(client, idp):
+    """§7.3: the admin groups the marketplace in sections — set at import, edited, cleared."""
+    admin = _h(client, idp)
+    resp = client.post(
+        "/api/marketplace/profiles/import",
+        params={"section": "  Ventas   y  CRM "},
+        content=dirty_export(_unique_root()),
+        headers={**admin, "Content-Type": "application/gzip"},
+    )
+    assert resp.status_code == 201, resp.text
+    profile = resp.json()["profile"]
+    assert profile["section"] == "Ventas y CRM"
+    pid = profile["id"]
+
+    def put(body):
+        return client.put(f"/api/marketplace/profiles/{pid}", json=body, headers=admin)
+
+    assert put({"name": "Sales Bot 2"}).json()["section"] == "Ventas y CRM"  # absent = unchanged
+    assert put({"section": "Soporte"}).json()["section"] == "Soporte"
+    assert put({"section": "   "}).json()["section"] is None                  # blank clears it
+    too_long = put({"section": "x" * 61})
+    assert too_long.status_code == 422 and too_long.json()["rule"] == "section_too_long"
+    listed = client.get("/api/marketplace/profiles", headers=admin).json()["profiles"]
+    assert next(p for p in listed if p["id"] == pid)["section"] is None
 
 
 def test_import_version_and_download(client, idp):
@@ -364,7 +422,9 @@ def test_import_rejections_are_clear(client, idp):
     assert resp.json()["rule"] == "path_traversal"
     resp = _import(client, admin, b"")
     assert resp.status_code == 422 and resp.json()["rule"] == "empty"
-    # A factory slug is reserved: importing over it needs another name.
+    # A template's slug is reserved once the template is in the marketplace: importing over it
+    # needs another name.
+    _add_template(client, admin, "analyst")
     analyst = _targz([("analyst/SOUL.md", "my own analyst")])
     resp = _import(client, admin, analyst)
     assert resp.status_code == 409 and resp.json()["rule"] == "factory_slug"
@@ -493,10 +553,7 @@ def test_bundle_delivers_profiles_and_their_packages(client, idp, alice_policy):
     root = _unique_root()
     prof = _import(client, admin, dirty_export(root)).json()["profile"]
     other = _import(client, admin, dirty_export(_unique_root())).json()["profile"]
-    factory = {
-        p["factory_key"]: p for p in client.get("/api/marketplace/profiles", headers=admin).json()["profiles"]
-        if p["source"] == "factory"
-    }
+    factory = {"analyst": _add_template(client, admin, "analyst")["profile"]}
     alice_policy([
         {"profile_id": factory["analyst"]["id"], "model": "glm-5.2"},
         {"profile_id": prof["id"], "model": "glm-5.2"},

@@ -18,6 +18,9 @@ import type {
   MarketplaceList,
   MarketplaceProfile,
   MarketplaceProfileDetail,
+  MarketplaceTemplate,
+  MarketplaceTemplateResult,
+  MarketplaceTemplates,
 } from "@/lib/types";
 import { dateTime } from "@/lib/format";
 import {
@@ -47,15 +50,52 @@ import {
 } from "@/components/icons";
 import { PROFILE_SLUG_RE, ProfileChips, formatBytes, strippedLabel } from "./profile-chips";
 
-type Filter = "all" | "factory" | "imported" | "archived";
+type View = "profiles" | "templates" | "archived";
 
 const BASE = "/api/marketplace/profiles";
 
 function SourceBadge({ profile }: { profile: MarketplaceProfile }) {
   return profile.source === "factory" ? (
-    <Badge tone="accent">De fábrica</Badge>
+    <Badge tone="accent">Plantilla</Badge>
   ) : (
     <Badge tone="info">Importado</Badge>
+  );
+}
+
+/** The sections in use, alphabetical: the import and edit forms suggest them. */
+function sectionsOf(profiles: MarketplaceProfile[]): string[] {
+  return [...new Set(profiles.map((p) => p.section).filter((s): s is string => Boolean(s)))].sort((a, b) =>
+    a.localeCompare(b, "es", { sensitivity: "base" }),
+  );
+}
+
+function SectionInput({
+  id,
+  value,
+  sections,
+  onChange,
+}: {
+  id: string;
+  value: string;
+  sections: string[];
+  onChange: (value: string) => void;
+}) {
+  return (
+    <>
+      <Input
+        id={id}
+        value={value}
+        maxLength={60}
+        list={`${id}-options`}
+        placeholder="p. ej. Ventas"
+        onChange={(e) => onChange(e.target.value)}
+      />
+      <datalist id={`${id}-options`}>
+        {sections.map((s) => (
+          <option key={s} value={s} />
+        ))}
+      </datalist>
+    </>
   );
 }
 
@@ -76,68 +116,170 @@ function PolicyUsage({ profile }: { profile: MarketplaceProfile }) {
   );
 }
 
+function ProfileCard({ profile: p, index, onOpen }: { profile: MarketplaceProfile; index: number; onOpen: () => void }) {
+  return (
+    <Card className="ta-rise flex flex-col" style={{ animationDelay: `${index * 50}ms` }}>
+      <CardBody className="flex flex-1 flex-col gap-3">
+        <div className="flex items-start justify-between gap-2">
+          <div className="min-w-0">
+            <p className="truncate text-sm font-semibold text-foreground">{p.name}</p>
+            <p className="font-mono text-[11px] text-faint">
+              {p.slug} · v{p.latest.version}
+            </p>
+          </div>
+          <div className="flex shrink-0 flex-col items-end gap-1">
+            <SourceBadge profile={p} />
+            {p.status === "archived" ? <Badge tone="warning">Archivado</Badge> : null}
+          </div>
+        </div>
+        {p.description ? (
+          <p className="line-clamp-3 text-xs leading-relaxed text-muted">{p.description}</p>
+        ) : p.latest.summary.soul_excerpt ? (
+          <p className="line-clamp-3 text-xs italic leading-relaxed text-muted">{p.latest.summary.soul_excerpt}</p>
+        ) : null}
+        <ProfileChips summary={p.latest.summary} />
+        <div className="mt-auto flex items-center justify-between gap-2 pt-2 text-[11px]">
+          <PolicyUsage profile={p} />
+          <Button size="sm" variant="secondary" onClick={onOpen}>
+            Ver ficha
+          </Button>
+        </div>
+      </CardBody>
+    </Card>
+  );
+}
+
+function TemplateCard({
+  template: t,
+  index,
+  canManage,
+  onAdded,
+  onOpen,
+}: {
+  template: MarketplaceTemplate;
+  index: number;
+  canManage: boolean;
+  onAdded: (result: MarketplaceTemplateResult) => void;
+  onOpen: (id: string) => void;
+}) {
+  const { push } = useToast();
+  const [busy, setBusy] = useState(false);
+  const inMarketplace = t.profile?.status === "active";
+
+  async function add() {
+    setBusy(true);
+    try {
+      const result = await api<MarketplaceTemplateResult>(`${BASE}/templates/${t.key}`, { method: "POST" });
+      push("success", result.restored ? `${t.name} restaurado en tu marketplace.` : `${t.name} añadido a tu marketplace.`);
+      onAdded(result);
+    } catch (cause) {
+      push("error", cause instanceof ApiError ? cause.message : "No se pudo añadir la plantilla.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Card className="ta-rise flex flex-col" style={{ animationDelay: `${index * 50}ms` }}>
+      <CardBody className="flex flex-1 flex-col gap-3">
+        <div className="flex items-start justify-between gap-2">
+          <p className="truncate text-sm font-semibold text-foreground">{t.name}</p>
+          {inMarketplace ? (
+            <Badge tone="success">En tu marketplace</Badge>
+          ) : t.profile ? (
+            <Badge tone="warning">Archivada</Badge>
+          ) : (
+            <Badge tone="neutral">Plantilla</Badge>
+          )}
+        </div>
+        <p className="line-clamp-3 text-xs leading-relaxed text-muted">{t.description}</p>
+        <ProfileChips summary={t.summary} />
+        <div className="mt-auto flex justify-end gap-2 pt-2">
+          {inMarketplace && t.profile ? (
+            <Button size="sm" variant="secondary" onClick={() => onOpen(t.profile!.id)}>
+              Ver ficha
+            </Button>
+          ) : canManage ? (
+            <Button size="sm" variant="primary" loading={busy} onClick={() => void add()}>
+              {t.profile ? <IconRestore size={13} /> : <IconPackage size={13} />}{" "}
+              {t.profile ? "Restaurar en el marketplace" : "Añadir al marketplace"}
+            </Button>
+          ) : null}
+        </div>
+      </CardBody>
+    </Card>
+  );
+}
+
 export function MarketplacePage({ canManage }: { canManage: boolean }) {
   const list = useApi<MarketplaceList>(`${BASE}?include_archived=true`);
-  const [filter, setFilter] = useState<Filter>("all");
+  const templates = useApi<MarketplaceTemplates>(`${BASE}/templates`);
+  const [view, setView] = useState<View>("profiles");
   const [query, setQuery] = useState("");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   // null = diálogo cerrado; "" = perfil nuevo; "<slug>" = nueva versión de ese perfil.
   const [importSlug, setImportSlug] = useState<string | null>(null);
 
   const profiles = useMemo(() => list.data?.profiles ?? [], [list.data]);
-  const counts = useMemo(() => {
-    const active = profiles.filter((p) => p.status === "active");
-    return {
-      all: active.length,
-      factory: active.filter((p) => p.source === "factory").length,
-      imported: active.filter((p) => p.source === "imported").length,
-      archived: profiles.length - active.length,
-    };
-  }, [profiles]);
-  const visible = useMemo(() => {
+  const sections = useMemo(() => sectionsOf(profiles), [profiles]);
+  const templateItems = useMemo(() => templates.data?.templates ?? [], [templates.data]);
+  const matches = useMemo(() => {
     const q = query.trim().toLowerCase();
-    return profiles
-      .filter((p) =>
-        filter === "archived"
-          ? p.status === "archived"
-          : p.status === "active" && (filter === "all" || p.source === filter),
-      )
-      .filter(
-        (p) =>
-          !q ||
-          `${p.name} ${p.slug} ${p.description} ${p.latest.summary.skills.map((s) => s.name).join(" ")}`
-            .toLowerCase()
-            .includes(q),
-      );
-  }, [profiles, filter, query]);
+    return (p: MarketplaceProfile) =>
+      !q ||
+      `${p.name} ${p.slug} ${p.description} ${p.section ?? ""} ${p.latest.summary.skills.map((s) => s.name).join(" ")}`
+        .toLowerCase()
+        .includes(q);
+  }, [query]);
+  const active = useMemo(() => profiles.filter((p) => p.status === "active"), [profiles]);
+  const archived = useMemo(() => profiles.filter((p) => p.status === "archived" && matches(p)), [profiles, matches]);
+  // Secciones del marketplace (§7.3): alfabéticas, "Sin sección" al final.
+  const grouped = useMemo(() => {
+    const groups = new Map<string, MarketplaceProfile[]>();
+    for (const p of active.filter(matches)) {
+      groups.set(p.section ?? "", [...(groups.get(p.section ?? "") ?? []), p]);
+    }
+    return [...groups.entries()].sort(([a], [b]) =>
+      a === "" ? 1 : b === "" ? -1 : a.localeCompare(b, "es", { sensitivity: "base" }),
+    );
+  }, [active, matches]);
+
+  function refreshAll() {
+    list.refetch();
+    templates.refetch();
+  }
+
+  const loading = view === "templates" ? templates.loading : list.loading;
+  const error = view === "templates" ? templates.error : list.error;
 
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <Tabs
           tabs={[
-            { id: "all", label: "Todos", count: counts.all },
-            { id: "factory", label: "De fábrica", count: counts.factory },
-            { id: "imported", label: "Importados", count: counts.imported },
-            { id: "archived", label: "Archivados", count: counts.archived },
+            { id: "profiles", label: "Perfiles", count: active.length },
+            { id: "templates", label: "Plantillas", count: templateItems.length },
+            { id: "archived", label: "Archivados", count: profiles.length - active.length },
           ]}
-          active={filter}
-          onChange={(id) => setFilter(id as Filter)}
+          active={view}
+          onChange={(id) => setView(id as View)}
         />
         <div className="flex items-center gap-2">
-          <div className="relative">
-            <IconSearch
-              size={14}
-              className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-faint"
-            />
-            <Input
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="Buscar perfil o skill…"
-              aria-label="Buscar perfiles"
-              className="w-60 pl-8"
-            />
-          </div>
+          {view !== "templates" ? (
+            <div className="relative">
+              <IconSearch
+                size={14}
+                className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-faint"
+              />
+              <Input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Buscar perfil, sección o skill…"
+                aria-label="Buscar perfiles"
+                className="w-64 pl-8"
+              />
+            </div>
+          ) : null}
           {canManage ? (
             <Button variant="primary" size="sm" onClick={() => setImportSlug("")}>
               <IconUpload size={13} /> Importar perfil
@@ -146,58 +288,96 @@ export function MarketplacePage({ canManage }: { canManage: boolean }) {
         </div>
       </div>
 
-      {list.loading ? (
+      {loading ? (
         <TableSkeleton rows={3} cols={3} />
-      ) : list.error ? (
-        <ErrorState error={list.error} onRetry={list.refetch} context={`GET ${BASE}`} />
-      ) : visible.length === 0 ? (
+      ) : error ? (
+        <ErrorState
+          error={error}
+          onRetry={view === "templates" ? templates.refetch : list.refetch}
+          context={`GET ${view === "templates" ? `${BASE}/templates` : BASE}`}
+        />
+      ) : view === "templates" ? (
+        <div className="space-y-3">
+          <p className="text-xs text-muted">
+            Perfiles listos que incluye la plataforma. Tu marketplace empieza vacío: añade solo los que tu
+            organización vaya a usar.
+          </p>
+          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+            {templateItems.map((t, i) => (
+              <TemplateCard
+                key={t.key}
+                template={t}
+                index={i}
+                canManage={canManage}
+                onAdded={(result) => {
+                  refreshAll();
+                  setSelectedId(result.profile.id);
+                }}
+                onOpen={setSelectedId}
+              />
+            ))}
+          </div>
+        </div>
+      ) : view === "archived" ? (
+        archived.length === 0 ? (
+          <EmptyState
+            icon={<IconArchive size={18} />}
+            title={query ? "Ningún perfil archivado coincide con la búsqueda" : "No hay perfiles archivados"}
+          />
+        ) : (
+          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+            {archived.map((p, i) => (
+              <ProfileCard key={p.id} profile={p} index={i} onOpen={() => setSelectedId(p.id)} />
+            ))}
+          </div>
+        )
+      ) : active.length === 0 ? (
         <EmptyState
           icon={<IconAgents size={18} />}
-          title={query ? "Ningún perfil coincide con la búsqueda" : filter === "archived" ? "No hay perfiles archivados" : "No hay perfiles"}
+          title="Tu marketplace está vacío"
           description={
-            canManage && filter !== "archived"
-              ? "Exporta un perfil en Hermes con `hermes profile export <nombre>` e impórtalo aquí."
-              : undefined
+            canManage
+              ? "Importa un perfil exportado con `hermes profile export <nombre>` o empieza con una plantilla."
+              : "El administrador de la organización todavía no ha publicado perfiles."
+          }
+          action={
+            canManage ? (
+              <div className="flex flex-wrap justify-center gap-2">
+                <Button size="sm" variant="primary" onClick={() => setImportSlug("")}>
+                  <IconUpload size={13} /> Importar perfil
+                </Button>
+                <Button size="sm" variant="secondary" onClick={() => setView("templates")}>
+                  <IconPackage size={13} /> Ver plantillas
+                </Button>
+              </div>
+            ) : undefined
           }
         />
+      ) : grouped.length === 0 ? (
+        <EmptyState icon={<IconSearch size={18} />} title="Ningún perfil coincide con la búsqueda" />
       ) : (
-        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-          {visible.map((p, i) => (
-            <Card key={p.id} className="ta-rise flex flex-col" style={{ animationDelay: `${i * 50}ms` }}>
-              <CardBody className="flex flex-1 flex-col gap-3">
-                <div className="flex items-start justify-between gap-2">
-                  <div className="min-w-0">
-                    <p className="truncate text-sm font-semibold text-foreground">{p.name}</p>
-                    <p className="font-mono text-[11px] text-faint">
-                      {p.slug} · v{p.latest.version}
-                    </p>
-                  </div>
-                  <div className="flex shrink-0 flex-col items-end gap-1">
-                    <SourceBadge profile={p} />
-                    {p.status === "archived" ? <Badge tone="warning">Archivado</Badge> : null}
-                  </div>
-                </div>
-                {p.description ? (
-                  <p className="line-clamp-3 text-xs leading-relaxed text-muted">{p.description}</p>
-                ) : p.latest.summary.soul_excerpt ? (
-                  <p className="line-clamp-3 text-xs italic leading-relaxed text-muted">
-                    {p.latest.summary.soul_excerpt}
-                  </p>
-                ) : null}
-                <ProfileChips summary={p.latest.summary} />
-                <div className="mt-auto flex items-center justify-between gap-2 pt-2 text-[11px]">
-                  <PolicyUsage profile={p} />
-                  <Button size="sm" variant="secondary" onClick={() => setSelectedId(p.id)}>
-                    Ver ficha
-                  </Button>
-                </div>
-              </CardBody>
-            </Card>
+        <div className="space-y-6">
+          {grouped.map(([section, items]) => (
+            <section key={section || "-"} aria-label={section || "Sin sección"} className="space-y-3">
+              <div className="flex items-baseline gap-2 border-b border-border-subtle pb-1.5">
+                <h3 className={`text-sm font-semibold ${section ? "text-foreground" : "text-muted"}`}>
+                  {section || "Sin sección"}
+                </h3>
+                <span className="text-[11px] text-faint">
+                  {items.length} {items.length === 1 ? "perfil" : "perfiles"}
+                </span>
+              </div>
+              <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+                {items.map((p, i) => (
+                  <ProfileCard key={p.id} profile={p} index={i} onOpen={() => setSelectedId(p.id)} />
+                ))}
+              </div>
+            </section>
           ))}
         </div>
       )}
       <p className="text-xs text-faint">
-        Asigna los perfiles en{" "}
+        Agrupa los perfiles en secciones desde su ficha (Editar). Asígnalos en{" "}
         <Link className="underline" href="/policies">
           Policies → Agentes
         </Link>
@@ -208,8 +388,9 @@ export function MarketplacePage({ canManage }: { canManage: boolean }) {
       <ProfileDetailDialog
         profileId={selectedId}
         canManage={canManage}
+        sections={sections}
         onClose={() => setSelectedId(null)}
-        onChanged={list.refetch}
+        onChanged={refreshAll}
         onImportVersion={(slug) => {
           setSelectedId(null);
           setImportSlug(slug);
@@ -217,10 +398,11 @@ export function MarketplacePage({ canManage }: { canManage: boolean }) {
       />
       <ImportDialog
         slug={importSlug}
+        sections={sections}
         onClose={() => setImportSlug(null)}
         onImported={(result) => {
-          list.refetch();
-          if (!result.unchanged || result.created) setFilter(result.profile.source === "factory" ? "factory" : "all");
+          refreshAll();
+          if (!result.unchanged || result.created) setView("profiles");
         }}
         onOpenProfile={(id) => {
           setImportSlug(null);
@@ -237,12 +419,14 @@ type DetailTab = "summary" | "skills" | "runtime" | "sanitize" | "versions" | "p
 function ProfileDetailDialog({
   profileId,
   canManage,
+  sections,
   onClose,
   onChanged,
   onImportVersion,
 }: {
   profileId: string | null;
   canManage: boolean;
+  sections: string[];
   onClose: () => void;
   onChanged: () => void;
   onImportVersion: (slug: string) => void;
@@ -250,7 +434,7 @@ function ProfileDetailDialog({
   const { push } = useToast();
   const detail = useApi<MarketplaceProfileDetail>(profileId ? `${BASE}/${profileId}` : null);
   const [tab, setTab] = useState<DetailTab>("summary");
-  const [editing, setEditing] = useState<{ name: string; description: string } | null>(null);
+  const [editing, setEditing] = useState<{ name: string; description: string; section: string } | null>(null);
   const [busy, setBusy] = useState(false);
   const [archiveBlockers, setArchiveBlockers] = useState<{ name: string; default: boolean }[] | null>(null);
 
@@ -365,7 +549,7 @@ function ProfileDetailDialog({
               <Button
                 size="sm"
                 variant="primary"
-                onClick={() => setEditing({ name: p.name, description: p.description ?? "" })}
+                onClick={() => setEditing({ name: p.name, description: p.description ?? "", section: p.section ?? "" })}
               >
                 Editar
               </Button>
@@ -383,6 +567,7 @@ function ProfileDetailDialog({
           <div className="flex flex-wrap items-center gap-2">
             <SourceBadge profile={p} />
             {p.status === "archived" ? <Badge tone="warning">Archivado</Badge> : <Badge tone="success">Activo</Badge>}
+            {p.section ? <Badge tone="neutral">Sección: {p.section}</Badge> : null}
             {s.format === "hermes-distribution" ? <Badge tone="neutral">Distribución de Hermes</Badge> : null}
             <span className="font-mono text-[11px] text-faint" title={p.latest.sha256}>
               sha256 {p.latest.sha256.slice(0, 12)}…
@@ -406,6 +591,18 @@ function ProfileDetailDialog({
                   maxLength={1000}
                   value={editing.description}
                   onChange={(e) => setEditing({ ...editing, description: e.target.value })}
+                />
+              </Field>
+              <Field
+                label="Sección"
+                htmlFor="mk-edit-section"
+                hint="Agrupa el perfil en el marketplace (Ventas, Soporte, TI…). Vacía = sin sección."
+              >
+                <SectionInput
+                  id="mk-edit-section"
+                  value={editing.section}
+                  sections={sections}
+                  onChange={(section) => setEditing({ ...editing, section })}
                 />
               </Field>
               <div className="flex justify-end gap-2">
@@ -488,7 +685,7 @@ function ProfileDetailDialog({
               ) : null}
               <p className="text-faint">
                 Versión {p.latest.version} importada {dateTime(p.latest.imported_at)}
-                {p.latest.imported_by ? ` por ${p.latest.imported_by}` : p.source === "factory" ? " (catálogo de fábrica)" : ""}.
+                {p.latest.imported_by ? ` por ${p.latest.imported_by}` : p.source === "factory" ? " (plantilla de la plataforma)" : ""}.
               </p>
             </div>
           ) : null}
@@ -667,17 +864,20 @@ const NAME_RULES = new Set(["default_profile", "invalid_name", "factory_slug"]);
 
 function ImportDialog({
   slug,
+  sections,
   onClose,
   onImported,
   onOpenProfile,
 }: {
   slug: string | null;
+  sections: string[];
   onClose: () => void;
   onImported: (result: MarketplaceImportResult) => void;
   onOpenProfile: (id: string) => void;
 }) {
   const [file, setFile] = useState<File | null>(null);
   const [name, setName] = useState("");
+  const [section, setSection] = useState("");
   const [needsName, setNeedsName] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -689,6 +889,7 @@ function ImportDialog({
   function reset() {
     setFile(null);
     setName("");
+    setSection("");
     setNeedsName(false);
     setError(null);
     setResult(null);
@@ -711,7 +912,10 @@ function ImportDialog({
     setBusy(true);
     setError(null);
     try {
-      const query = effectiveName ? `?slug=${encodeURIComponent(effectiveName)}` : "";
+      const params = new URLSearchParams();
+      if (effectiveName) params.set("slug", effectiveName);
+      if (!isVersion && section.trim()) params.set("section", section.trim());
+      const query = params.toString() ? `?${params.toString()}` : "";
       const res = await apiUploadFile<MarketplaceImportResult>(`${BASE}/import${query}`, file);
       setResult(res);
       onImported(res);
@@ -831,6 +1035,15 @@ function ImportDialog({
                 placeholder="p. ej. ventas"
                 onChange={(e) => setName(e.target.value.toLowerCase())}
               />
+            </Field>
+          ) : null}
+          {!isVersion ? (
+            <Field
+              label="Sección (opcional)"
+              htmlFor="mk-import-section"
+              hint="Dónde se agrupa en el marketplace: Ventas, Soporte, TI… Puedes cambiarla después."
+            >
+              <SectionInput id="mk-import-section" value={section} sections={sections} onChange={setSection} />
             </Field>
           ) : null}
           {error ? (

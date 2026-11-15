@@ -158,11 +158,24 @@ def trust_dir() -> Path:
 
 
 def _write_secret(path: Path, data: str) -> None:
-    """Escribe un secreto con permisos 0600 (escritura atómica)."""
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(data, encoding="utf-8")
-    os.chmod(tmp, 0o600)
-    tmp.replace(path)
+    """Escribe un secreto con permisos 0600 (escritura atómica).
+
+    The temp name is unique to this write: several writers of the device directory (the plugin
+    copies of a multiplexed gateway, a CLI process) must never share one temp file.
+    """
+    import secrets
+
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.{secrets.token_hex(4)}.tmp")
+    try:
+        tmp.write_text(data, encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        tmp.replace(path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def api_base() -> str:

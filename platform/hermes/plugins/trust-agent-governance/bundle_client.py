@@ -51,9 +51,12 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import ssl
+import sys
 import threading
 import time
+import types
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -152,6 +155,29 @@ def api_base() -> str:
     return os.environ.get("TRUST_AGENT_API", "http://127.0.0.1:8000").rstrip("/")
 
 
+def atomic_write_text(path: Path, text: str, *, mode: int | None = None) -> None:
+    """Atomic replace through a temp file whose name is UNIQUE to this write.
+
+    The device files live in one directory shared by every writer of the device: the plugin
+    copies of a multiplexed gateway (one per profile), a CLI process, the desktop. A fixed
+    ``<name>.tmp`` let one writer move another's temp out from under it (WinError 2 on Windows
+    killed sync threads); a per-write name makes each replace independent. Raises ``OSError``
+    like the plain write; the temp is removed when the write does not land.
+    """
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.{secrets.token_hex(4)}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        if mode is not None:
+            os.chmod(tmp, mode)
+        tmp.replace(path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def bundle_cache_path() -> Path:
     return trust_dir() / "governance-bundle.jws"
 
@@ -228,10 +254,7 @@ def save_renewed_device_token(device: dict[str, str], new_token: str) -> None:
         "token": new_token,
         "renewed_at": int(time.time()),
     })
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    os.chmod(tmp, 0o600)
-    tmp.replace(path)
+    atomic_write_text(path, json.dumps(payload, indent=2), mode=0o600)
 
 
 def log_event(event: str, **fields: Any) -> None:
@@ -281,12 +304,8 @@ def _load_jti_store() -> dict[str, Any]:
 
 def _save_jti_store(store: dict[str, Any]) -> None:
     seen = sorted(set(store["seen"]))[-_JTI_LIMIT:]
-    tmp = _jti_store_path().with_suffix(".json.tmp")
     try:
-        tmp.write_text(
-            json.dumps({"seen": seen, "current": store["current"]}), encoding="utf-8"
-        )
-        tmp.replace(_jti_store_path())
+        atomic_write_text(_jti_store_path(), json.dumps({"seen": seen, "current": store["current"]}))
     except OSError:
         pass  # best-effort: la firma/aud/exp siguen siendo los gates duros
 
@@ -378,9 +397,7 @@ def load_cached_bundle(device_id: str) -> dict[str, Any] | None:
 
 
 def _write_bundle_cache(jws: str) -> None:
-    tmp = bundle_cache_path().with_suffix(".jws.tmp")
-    tmp.write_text(jws, encoding="utf-8")
-    tmp.replace(bundle_cache_path())
+    atomic_write_text(bundle_cache_path(), jws)
 
 
 # Botón «Sincronizar política» del desktop (spec 045, seguimiento): Electron escribe
@@ -431,7 +448,12 @@ def sync_once(device: dict[str, str]) -> dict[str, Any]:
     if not jws:
         raise NetworkSyncError("control plane returned no bundle")
     payload = verify_bundle(jws, device_id=device["device_id"], remember=True)
-    _write_bundle_cache(jws)
+    try:
+        _write_bundle_cache(jws)
+    except OSError as exc:
+        # The bundle is verified and applies now; only the offline copy is stale until the next
+        # cycle. A failed cache write must not turn a good sync into a failed one.
+        log_event("bundle_cache_write_failed", detail=str(exc))
     log_event(
         "bundle_synced",
         policy_version=payload.get("policy_version"),
@@ -499,6 +521,40 @@ def post_heartbeat(
 
 
 # ---------------------------------------------------------------------------
+# One syncer per device per PROCESS (spec 045 follow-up, 0.7.2)
+# ---------------------------------------------------------------------------
+# The desktop's gateway serves every profile from ONE process and loads this plugin once per
+# profile — a separate module copy per profile directory. Each copy used to run its own
+# BundleSyncer: N network syncs and heartbeats per cycle, N concurrent profile reconciliations,
+# and N writers of the same device files. Now the first syncer of a device directory in the
+# process is the LEADER (network sync, heartbeat, token renewal, profile delivery, status file);
+# every other copy is a FOLLOWER that mirrors the leader's verified state into its own
+# GovernanceState (no network, no writes) and takes over when the leader stops. The registry
+# lives in ``sys.modules`` so every copy, whatever module name it was imported under, sees the
+# same one.
+_SYNCER_REGISTRY_KEY = "_trust_agent_governance_syncers"
+_FOLLOW_POLL_SECONDS = 2.0
+
+
+def _syncer_registry() -> Any:
+    registry = sys.modules.get(_SYNCER_REGISTRY_KEY)
+    if registry is None:
+        fresh = types.ModuleType(_SYNCER_REGISTRY_KEY)
+        fresh.lock = threading.Lock()  # type: ignore[attr-defined]
+        fresh.leaders = {}  # type: ignore[attr-defined]
+        registry = sys.modules.setdefault(_SYNCER_REGISTRY_KEY, fresh)
+    return registry
+
+
+def _device_key() -> str:
+    """Identity of the device files this syncer governs: copies sharing it share one leader."""
+    try:
+        return os.path.normcase(str(trust_dir().resolve()))
+    except OSError:
+        return os.path.normcase(str(trust_dir()))
+
+
+# ---------------------------------------------------------------------------
 # BundleSyncer — ciclo de vida del sync (arranque + periódico + al vencimiento)
 # ---------------------------------------------------------------------------
 class BundleSyncer:
@@ -508,6 +564,9 @@ class BundleSyncer:
     inmediato con caché invalidada; red caída → gracia mientras el bundle
     vigente no expire, luego RESTRINGIDO(expired); sin bundle →
     RESTRINGIDO(no_bundle).
+
+    In a multiplexed gateway only one syncer per device directory talks to the control plane
+    (the leader); the others follow it (see the registry above).
     """
 
     def __init__(self, interval: float | None = None) -> None:
@@ -526,31 +585,83 @@ class BundleSyncer:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_tick_started = 0.0
+        self._device_key = ""
+        self.role = "idle"  # "leader" | "follower" once started
 
     # -- ciclo ---------------------------------------------------------------
     def start(self) -> None:
         if self._thread is not None:
             return
+        self._device_key = _device_key()
         self._thread = threading.Thread(
-            target=self._run, name="trust-governance-sync", daemon=True
+            target=self._main, name="trust-governance-sync", daemon=True
         )
         self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
+        registry = _syncer_registry()
+        with registry.lock:
+            if registry.leaders.get(self._device_key) is self:
+                del registry.leaders[self._device_key]
         if self._thread is not None:
             self._thread.join(timeout=5.0)
             self._thread = None
 
+    def is_running(self) -> bool:
+        thread = self._thread
+        return thread is not None and thread.is_alive() and not self._stop.is_set()
+
+    def governance_snapshot(self) -> dict[str, Any]:
+        """The leader's state as its followers mirror it (this copy's GovernanceState)."""
+        return governance_state.get_state().snapshot()
+
+    def _try_lead(self) -> bool:
+        registry = _syncer_registry()
+        with registry.lock:
+            current = registry.leaders.get(self._device_key)
+            running = getattr(current, "is_running", None)
+            if current is None or current is self or not (callable(running) and running()):
+                registry.leaders[self._device_key] = self
+                return True
+            return False
+
+    def _main(self) -> None:
+        while not self._stop.is_set():
+            if self._try_lead():
+                if self.role != "leader":
+                    log_event("sync_leader", device_dir=self._device_key)
+                self.role = "leader"
+                self._run()
+                return
+            self.role = "follower"
+            self._follow_once()
+            self._stop.wait(_FOLLOW_POLL_SECONDS)
+
+    def _follow_once(self) -> None:
+        """Mirror the leader's verified state into this copy's GovernanceState."""
+        leader = _syncer_registry().leaders.get(self._device_key)
+        snapshot_of = getattr(leader, "governance_snapshot", None)
+        if not callable(snapshot_of):
+            return
+        try:
+            governance_state.get_state().mirror_from(snapshot_of())
+        except Exception as exc:  # noqa: BLE001 - a follower never takes the gateway down
+            log_event("sync_follow_error", detail=repr(exc)[:300])
+
     def _run(self) -> None:
         while not self._stop.is_set():
             self._last_tick_started = time.time()
-            self.tick()
-            # Re-sync periódico Y adelantado al vencimiento del bundle en
-            # caché (REQ-GOH-004): dormir como mucho hasta el exp.
-            st = governance_state.get_state()
-            grace = st.grace_remaining_seconds()
-            wait = self.interval if grace is None else min(self.interval, max(grace, 1.0))
+            try:
+                self.tick()
+                # Re-sync periódico Y adelantado al vencimiento del bundle en
+                # caché (REQ-GOH-004): dormir como mucho hasta el exp.
+                st = governance_state.get_state()
+                grace = st.grace_remaining_seconds()
+                wait = self.interval if grace is None else min(self.interval, max(grace, 1.0))
+            except Exception as exc:  # noqa: BLE001 - the sync thread must survive any cycle
+                log_event("sync_cycle_crashed", detail=repr(exc)[:500])
+                wait = self.interval
             self._sleep_until_next(wait)
 
     def _sleep_until_next(self, wait: float) -> None:

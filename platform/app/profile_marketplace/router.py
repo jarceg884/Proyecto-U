@@ -55,10 +55,20 @@ async def _upload_body(request: Request) -> bytes:
 class ProfilePatch(BaseModel):
     name: str | None = None
     description: str | None = None
+    # Sent = set it (blank clears it); absent = unchanged.
+    section: str | None = None
 
 
 class ArchiveBody(BaseModel):
     confirm: bool = False
+
+
+class TemplateBody(BaseModel):
+    section: str | None = None
+
+
+def _fields_set(model: BaseModel) -> set[str]:
+    return set(getattr(model, "model_fields_set", None) or getattr(model, "__fields_set__", set()))
 
 
 @router.get("")
@@ -68,7 +78,9 @@ def list_profiles(
     conn: Connection = Depends(get_tx),
 ):
     _require_admin(principal)
-    service.ensure_factory_profiles(conn, principal.tenant_id)
+    # The templates the tenant added follow the factory release; nothing is ever added here
+    # (the marketplace starts empty, §7.3).
+    service.refresh_factory_profiles(conn, principal.tenant_id)
     return {"profiles": service.list_profiles(conn, include_archived)}
 
 
@@ -76,15 +88,37 @@ def list_profiles(
 def import_profile(
     response: Response,
     slug: str | None = None,
+    section: str | None = None,
     data: bytes = Depends(_upload_body),
     principal: Principal = Depends(get_principal),
     conn: Connection = Depends(get_tx),
 ):
     _require_org_admin(principal)
-    result = service.import_package(conn, principal, data, slug_override=slug or None)
+    result = service.import_package(conn, principal, data, slug_override=slug or None, section=section)
     if result["unchanged"]:
         response.status_code = 200
     return result
+
+
+@router.get("/templates")
+def list_templates(
+    principal: Principal = Depends(get_principal),
+    conn: Connection = Depends(get_tx),
+):
+    """The factory templates (Analyst, Coder, Ops) and which ones this marketplace has."""
+    _require_admin(principal)
+    return {"templates": service.template_catalog(conn)}
+
+
+@router.post("/templates/{key}")
+def add_template(
+    key: str,
+    body: TemplateBody | None = None,
+    principal: Principal = Depends(get_principal),
+    conn: Connection = Depends(get_tx),
+):
+    _require_org_admin(principal)
+    return service.add_template(conn, principal, key, section=body.section if body else None)
 
 
 @router.get("/{profile_id}")
@@ -105,7 +139,10 @@ def update_profile(
     conn: Connection = Depends(get_tx),
 ):
     _require_org_admin(principal)
-    return service.update_profile(conn, principal, profile_id, body.name, body.description)
+    return service.update_profile(
+        conn, principal, profile_id, body.name, body.description,
+        section=body.section, set_section="section" in _fields_set(body),
+    )
 
 
 @router.post("/{profile_id}/archive")
