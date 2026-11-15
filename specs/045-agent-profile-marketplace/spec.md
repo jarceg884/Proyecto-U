@@ -151,6 +151,12 @@ Pedido del cliente sobre la 0.7.1 instalada: «no le hace wake up al default», 
   - Tenants existentes: la migración archiva los perfiles de fábrica que se sembraron solos y que ninguna política asigna (reversible: Restaurar o añadir la plantilla; nada se borra), con su evento de auditoría (`reason: marketplace_empty_by_default`). Los que una política asigna se quedan.
   - **Secciones:** `agent_profiles.section` (texto libre, 1–60 caracteres) que el admin pone al importar o desde la ficha (Editar); vacía = «Sin sección». La consola agrupa la pestaña Perfiles por sección (alfabético, «Sin sección» al final) y tiene las pestañas Plantillas y Archivados; la búsqueda incluye la sección.
 
+### 7.4 Seguimiento 0.7.3 (MSIX 0.7.3 + plugin 0.7.3)
+
+- **El raíz `default` no aparecía en el riel de la 0.7.2 instalada.** La 0.7.2 dejó de filtrarlo de la lista, pero el riel lo pinta en su propio botón fijo (el «home pill», a la izquierda) y la 0.7.0 había apagado ese botón cuando el equipo tiene perfiles de la organización (`!governedView.assigned`, con un `multiProfile` que contaba 1 perfil de la organización como «varios»). La 0.7.3 quita ambas condiciones: el botón vuelve a mostrar el raíz junto a los perfiles de la organización (y alterna con «todos los perfiles» estando en él, como en Hermes).
+- La versión sube a 0.7.3 (MSIX, `bundle.json` y plugin, sin cambios de código en el plugin) porque Windows no reinstala la misma identidad de paquete.
+- `locales/_keys.desktop.json` se regenera: las claves de «Sincronizar política» de la 0.7.1 no estaban (solo afectaba al test `i18n-keys`).
+
 ## 8. Reemplazo de Agentes compartidos (D-045-08)
 
 - La página **Agentes** pasa a ser el marketplace. La UI de agentes compartidos y grants se retira.

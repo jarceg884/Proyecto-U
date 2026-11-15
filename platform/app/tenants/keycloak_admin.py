@@ -10,6 +10,7 @@ silently DROPS undeclared attributes, so every provisioned realm MUST set
 unmanagedAttributePolicy=ENABLED or the tenant_id attribute (and therefore
 the signed claim) never reaches the ID token.
 """
+import re
 import secrets
 from typing import Any
 
@@ -19,6 +20,23 @@ from ..config import Settings
 
 WEB_CLIENT_ID = "trust-agent-web"
 TENANT_MAPPER_NAME = "tenant_id"
+
+# Keycloak's default user profile validates firstName/lastName with
+# `person-name-prohibited-characters`: an invite whose display name carried "(Ventas)" was
+# refused with error-person-name-invalid-character and the whole invite failed. Our directory
+# keeps the name exactly as typed; only the identity provider's copy drops what it refuses.
+_KC_PERSON_NAME_PROHIBITED = re.compile(r'[<>&"\v$%!#?§;*~/\\|^=\[\]{}()\x00-\x1f\x7f]')
+
+
+def keycloak_person_names(
+    display_name: str | None, *, fallback_first: str, fallback_last: str
+) -> tuple[str, str]:
+    """(firstName, lastName) Keycloak accepts for ``display_name``."""
+    cleaned = " ".join(_KC_PERSON_NAME_PROHIBITED.sub(" ", display_name or "").split())
+    parts = cleaned.split(" ") if cleaned else []
+    first = parts[0] if parts else fallback_first
+    last = " ".join(parts[1:]) or fallback_last
+    return first, last
 
 # --- MFA via ACR/LoA (D-MFA-01) ---------------------------------------------
 # Keycloak 26 never emits `amr`; the control-plane MFA gate therefore reads
@@ -623,12 +641,15 @@ class KeycloakAdminClient:
         The one-time password is generated with secrets and returned exactly
         once — never stored in our DB.
         """
+        first_name, last_name = keycloak_person_names(
+            display_name, fallback_first="Admin", fallback_last="Admin"
+        )
         payload = {
             "username": username,
             "enabled": True,
             "email": email,
-            "firstName": (display_name or "Admin").split(" ")[0],
-            "lastName": " ".join((display_name or "Admin").split(" ")[1:]) or "Admin",
+            "firstName": first_name,
+            "lastName": last_name,
             "emailVerified": True,
             "requiredActions": ["CONFIGURE_TOTP"] if require_totp_action else [],
             "attributes": {"tenant_id": [tenant_id]},
@@ -705,13 +726,15 @@ class KeycloakAdminClient:
         when the username already exists (caller maps it to 409).
         Returns the new user's uuid.
         """
+        first_name, last_name = keycloak_person_names(
+            display_name or username, fallback_first=username, fallback_last="User"
+        )
         payload = {
             "username": username,
             "enabled": True,
             "email": email,
-            "firstName": (display_name or username).split(" ")[0],
-            "lastName": " ".join((display_name or username).split(" ")[1:])
-            or "User",
+            "firstName": first_name,
+            "lastName": last_name,
             # Dev-local v1 (spec 015 §4): no email verification round-trip.
             "emailVerified": True,
             "requiredActions": [],

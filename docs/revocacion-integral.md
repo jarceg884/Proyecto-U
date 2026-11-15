@@ -155,3 +155,12 @@ docker exec trust-agent-db psql -U postgres -d trust_agent -c \
 | Fail-closed (misma transacción) | spec 019 §9 Inc. 4 | `platform/app/devices/service.py::revoke` + `platform/app/errors.py::service_unavailable` |
 | Audit con resumen + cadena íntegra | constitution IV | `audit_service.emit` en `revoke` (payload `sweep`) |
 | Re-enrolamiento posterior | spec 007 upsert | `enroll` (sin cambios — verificado por test/live) |
+
+## 8. Borrar corta igual que revocar (2026-11-15)
+
+Hallazgo sobre el piloto: borrar un dispositivo desde la consola (`DELETE /api/devices/{id}`) borraba sus filas pero **no** bloqueaba la key de modelo en el gateway. La key que el equipo recibe al activarse es del USUARIO (`api_keys.device_id` nunca se llena), así que seguía respondiendo para quien conservara el `config.yaml` del equipo. Borrar un usuario (`DELETE /api/users/{id}`) tenía el mismo defecto con todas sus keys.
+
+- **Borrar un dispositivo activo** ejecuta antes el mismo sweep que la revocación (`_block_user_virtual_keys` + `_sweep_device_connector_grants`, motivo `device_deleted`) y el audit `device.deleted` lleva el resumen (`sweep`). Un dispositivo `pending` no dispara el sweep.
+- **Borrar un usuario** bloquea en el gateway cada key activa suya antes de borrar las filas; el audit `user.deleted` lleva `keys_blocked` (alias).
+- Ambos son fail-closed: si LiteLLM no puede bloquear, 503 y rollback (nada se borra).
+- Tests: `tests/test_device_revocation_sweep.py::test_delete_*` (dispositivo activo, gateway caído, pending; usuario y gateway caído).

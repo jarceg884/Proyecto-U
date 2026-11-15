@@ -798,7 +798,12 @@ def presence(
 # Integral revocation sweep (spec 019 Incremento 4, REQ-GOH-011 / D-GOH-05)
 # ---------------------------------------------------------------------------
 def _block_user_virtual_keys(
-    conn: Connection, principal: Principal, *, user_id: str, device_id: str
+    conn: Connection,
+    principal: Principal,
+    *,
+    user_id: str,
+    device_id: str,
+    reason: str = "device_revoked",
 ) -> list[dict]:
     """Block the user's ACTIVE LiteLLM virtual keys (REQ-GOH-011a).
 
@@ -844,7 +849,7 @@ def _block_user_virtual_keys(
             target_id=str(r["id"]),
             device_id=device_id,
             payload={
-                "reason": "device_revoked",
+                "reason": reason,
                 "device_id": device_id,
                 "alias": r["alias"],
             },
@@ -854,7 +859,12 @@ def _block_user_virtual_keys(
 
 
 def _sweep_device_connector_grants(
-    conn: Connection, principal: Principal, *, user_id: str, device_id: str
+    conn: Connection,
+    principal: Principal,
+    *,
+    user_id: str,
+    device_id: str,
+    reason: str = "device_revoked",
 ) -> list[dict]:
     """Disconnect the user's ACTIVE connector instances (REQ-GOH-011b).
 
@@ -885,7 +895,7 @@ def _sweep_device_connector_grants(
             device_id=device_id,
             payload={
                 "connector_slug": inst["connector_slug"],
-                "reason": "device_revoked",
+                "reason": reason,
                 "device_id": device_id,
             },
         )
@@ -896,7 +906,7 @@ def _sweep_device_connector_grants(
             type="connector_disconnected",
             payload={
                 "connector_slug": inst["connector_slug"],
-                "reason": "device_revoked",
+                "reason": reason,
                 "device_id": device_id,
             },
         )
@@ -984,11 +994,34 @@ def revoke(conn: Connection, *, principal: Principal, device_id: str) -> dict:
 def delete(conn: Connection, *, principal: Principal, device_id: str) -> None:
     """Hard-delete an enrolled device and its dependent rows.
 
-    Admin action from the console. Sessions and API keys are removed first so
-    the device row can be deleted without dangling references. Audit keeps the
-    fact (and the device id) after the row is gone.
+    Admin action from the console. Deleting an ACTIVE device cuts its access
+    exactly like ``revoke`` does before the rows go: the model key the device
+    received at activation is a USER-scoped virtual key (``api_keys.device_id``
+    is never populated), so removing the device row alone left that key working
+    at the gateway for whoever kept the device's ``config.yaml``. The same
+    sweep (keys blocked at LiteLLM, connector instances disconnected) runs
+    first and is fail-closed: a gateway failure rolls the whole delete back.
+    Sessions and API keys are removed so the device row can be deleted without
+    dangling references. Audit keeps the fact (and the device id) after the
+    row is gone.
     """
     row = _get_scoped_device(conn, principal, device_id)
+    sweep = {"keys_blocked": [], "connectors_disconnected": []}
+    if row["status"] == "active":
+        sweep["keys_blocked"] = _block_user_virtual_keys(
+            conn,
+            principal,
+            user_id=str(row["user_id"]),
+            device_id=device_id,
+            reason="device_deleted",
+        )
+        sweep["connectors_disconnected"] = _sweep_device_connector_grants(
+            conn,
+            principal,
+            user_id=str(row["user_id"]),
+            device_id=device_id,
+            reason="device_deleted",
+        )
     audit_service.emit(
         conn,
         tenant_id=principal.tenant_id,
@@ -1002,6 +1035,7 @@ def delete(conn: Connection, *, principal: Principal, device_id: str) -> None:
             "device_name": row["device_name"],
             "user_id": str(row["user_id"]),
             "previous_status": row["status"],
+            "sweep": sweep,
         },
     )
     conn.execute(
