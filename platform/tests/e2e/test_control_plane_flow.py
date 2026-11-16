@@ -48,7 +48,7 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-from tests.conftest import PLATFORM_DIR, bearer_headers
+from tests.conftest import KC_ADMIN_PASSWORD, PLATFORM_DIR, bearer_headers
 
 KC_HOST, KC_PORT = "127.0.0.1", 8080
 CLIENT_ID = "trust-agent-web"
@@ -123,7 +123,7 @@ def _admin_token() -> str:
     status, raw, _ = _request(
         "POST", "/realms/master/protocol/openid-connect/token",
         {"grant_type": "password", "client_id": "admin-cli",
-         "username": "admin", "password": "KeycloakDemo2026"},
+         "username": "admin", "password": KC_ADMIN_PASSWORD},
     )
     assert status == 200, raw
     return json.loads(raw)["access_token"]

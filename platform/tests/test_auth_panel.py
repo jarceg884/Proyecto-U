@@ -29,7 +29,7 @@ import uuid
 import httpx
 import pytest
 
-from tests.conftest import ADMIN_DSN, PLATFORM_DIR, TEST_DB
+from tests.conftest import ADMIN_DSN, KC_ADMIN_PASSWORD, PLATFORM_DIR, TEST_DB
 
 # ---------------------------------------------------------------------------
 # Fixtures of the live layer
@@ -222,7 +222,7 @@ def panel_realm(env):
         database_url=os.environ["TRUST_DATABASE_URL"],
         keycloak_admin_url=KC_BASE,
         keycloak_admin_user="admin",
-        keycloak_admin_password="KeycloakDemo2026",
+        keycloak_admin_password=KC_ADMIN_PASSWORD,
     ))
     kc.ensure_realm(REALM)
     kc.enable_unmanaged_attributes(REALM)

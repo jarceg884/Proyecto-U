@@ -29,6 +29,25 @@ from fastapi import APIRouter, Depends
 from fastapi.testclient import TestClient
 
 PLATFORM_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _local_kc_admin_password() -> str:
+    """Keycloak master admin password of the LOCAL stack: $KC_ADMIN_PASSWORD, else the repo's
+    gitignored .env (the variable docker-compose passes to Keycloak and the API). Never hardcode
+    it: this repository is public."""
+    import os
+    from pathlib import Path
+
+    value = os.environ.get("KC_ADMIN_PASSWORD", "")
+    env_file = Path(__file__).resolve().parents[2] / ".env"
+    if not value and env_file.exists():
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            if line.startswith("KC_ADMIN_PASSWORD="):
+                value = line.split("=", 1)[1].strip().strip('"').strip("'")
+    return value
+
+
+KC_ADMIN_PASSWORD = _local_kc_admin_password()
 DB_HOST = os.environ.get("TRUST_DB_HOST", "127.0.0.1")
 DB_PORT = os.environ.get("TRUST_DB_PORT", "55432")
 ADMIN_PASSWORD = os.environ.get("TRUST_DB_ADMIN_PASSWORD", "trustlocal")
@@ -265,7 +284,7 @@ def env(idp, litellm_fake):
     os.environ["TRUST_PROVIDER_OPERATOR_INITIAL_PASSWORD"] = "ProviderInitial!2026x"
     os.environ["TRUST_KEYCLOAK_ADMIN_URL"] = "http://127.0.0.1:8080"
     os.environ["TRUST_KEYCLOAK_ADMIN_USER"] = "admin"
-    os.environ["TRUST_KEYCLOAK_ADMIN_PASSWORD"] = "KeycloakDemo2026"
+    os.environ["TRUST_KEYCLOAK_ADMIN_PASSWORD"] = KC_ADMIN_PASSWORD
     from app.config import get_settings
     from app.db import reset_engine
 
