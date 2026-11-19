@@ -1,0 +1,13 @@
+# Gitleaks configuration.
+#
+# The profile-marketplace test builds a synthetic Hermes profile whose config carries an
+# obviously fake provider key (`or-1234567890abcdefgh`) so the redactor is exercised on a
+# value shaped like a real one. It has never been a valid credential and it is not present
+# in the sanitized output (the test asserts that). Allowlist only that exact fixture.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Synthetic fake OpenRouter key in the profile marketplace test fixture"
+paths = ['''platform/tests/test_profile_marketplace.py''']
+regexes = ['''or-1234567890abcdefgh''']
