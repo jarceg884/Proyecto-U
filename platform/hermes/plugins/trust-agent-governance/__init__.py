@@ -55,6 +55,7 @@ Config por entorno (perfil del usuario):
 """
 from __future__ import annotations
 
+import json
 import time
 from typing import Any
 
@@ -130,10 +131,40 @@ def _budget_line(snapshot: dict[str, Any]) -> str:
 
     def _level(name: str) -> str:
         lvl = budget.get(name) or {}
+        remaining = lvl.get("remaining_cents")
+        if remaining is None and not lvl.get("cutoff"):
+            return f"{name}: no limit"  # no budget of its own at this level
         cutoff = "CUTOFF" if lvl.get("cutoff") else "ok"
-        return f"{name}: {_usd(lvl.get('remaining_cents'))} ({cutoff})"
+        if isinstance(remaining, (int, float)):
+            # A budget lowered below the spend leaves $0.00, not a negative balance.
+            remaining = max(0, remaining)
+        return f"{name}: {_usd(remaining)} ({cutoff})"
 
     return ", ".join(_level(n) for n in ("user", "dept", "org"))
+
+
+# A turn that runs while the snapshot says "cut off" means the snapshot is stale: the gateway
+# refuses a cut-off key, so a request that reaches the model was let through (the budget was
+# raised or the period reset). Wake the syncer instead of waiting for its next cycle (up to 5
+# minutes) — through the same request file as the desktop's «Sync policy» button.
+_STALE_CUTOFF_SYNC_SECONDS = 60.0
+_last_stale_cutoff_sync = float("-inf")
+
+
+def _request_sync_for_stale_cutoff(now: float | None = None) -> bool:
+    global _last_stale_cutoff_sync
+    now = time.time() if now is None else now
+    if now - _last_stale_cutoff_sync < _STALE_CUTOFF_SYNC_SECONDS:
+        return False
+    _last_stale_cutoff_sync = now
+    try:
+        bundle_client.atomic_write_text(
+            bundle_client.trust_dir() / bundle_client.SYNC_REQUEST_FILE,
+            json.dumps({"requested_at": now, "reason": "stale_cutoff"}),
+        )
+    except OSError:
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -222,8 +253,13 @@ def _on_pre_llm_call(**_: Any) -> dict[str, str] | None:
         for name in ("user", "dept", "org")
         if (budget.get(name) or {}).get("cutoff")
     ]
+    if cutoffs:
+        _request_sync_for_stale_cutoff()
     cutoff_note = (
-        f" ATTENTION: spending is CUT OFF at the {' and '.join(cutoffs)}."
+        f" Note: at the last policy sync spending was CUT OFF at the "
+        f"{' and '.join(cutoffs)}, but this request reached the model, so access "
+        "has been restored since (a policy refresh was requested); do not tell "
+        "the user they are cut off."
         if cutoffs
         else ""
     )

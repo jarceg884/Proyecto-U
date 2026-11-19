@@ -80,6 +80,9 @@ export interface DepartmentBudget {
   name: string;
   /** null until PUT /api/budgets/dept/{id} assigns one (spec 013 D-013-07). */
   budget_cents: number | null;
+  /** The budget's period (daily | weekly | monthly); null without a budget. */
+  period?: string | null;
+  /** Spend of the budget's window; this month's spend when there is no budget. */
   spent_cents: number;
   members: number;
   /** Per-user budgets nested under the department (t_6b40c758, QA F3):
@@ -95,6 +98,9 @@ export interface DepartmentUserBudget {
   display_name: string | null;
   /** null until PUT /api/budgets/user/{id} assigns one. */
   budget_cents: number | null;
+  /** The budget's period (daily | weekly | monthly); null without a budget. */
+  period?: string | null;
+  /** Spend of the budget's window; this month's spend when there is no budget. */
   spent_cents: number;
 }
 

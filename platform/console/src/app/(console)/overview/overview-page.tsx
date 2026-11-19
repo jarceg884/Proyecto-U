@@ -7,15 +7,17 @@
  */
 import Link from "next/link";
 import { useApi } from "@/hooks/use-api";
-import { api } from "@/lib/api-client";
+import { api, ApiError } from "@/lib/api-client";
 import type { BudgetOverview, PolicyList } from "@/lib/types";
 import { centsToInput, usd, usagePct } from "@/lib/format";
+import { BUDGET_FORCE_COPY, budgetForceReason, type BudgetForceReason } from "@/lib/budget-force";
 import {
   Badge,
   Button,
   Card,
   CardBody,
   CardHeader,
+  ConfirmDialog,
   EmptyState,
   ErrorState,
   Progress,
@@ -36,26 +38,35 @@ export function OverviewPage() {
   const { push } = useToast();
   const [savingOrg, setSavingOrg] = useState(false);
   const [orgInput, setOrgInput] = useState<string | null>(null);
+  const [orgForce, setOrgForce] = useState<BudgetForceReason | null>(null);
   // Spec 038 (REQ-DO-023): empty-state con CTA al wizard de estructura.
   const [wizardOpen, setWizardOpen] = useState(false);
 
   const org = overview.data?.organization;
   const hasOrgBudget = org?.budget_cents != null;
 
-  async function saveOrgBudget() {
+  async function saveOrgBudget(force = false) {
     if (orgInput === null) return;
     setSavingOrg(true);
     try {
+      // Amount only: the API keeps the budget's period and threshold (a fixed "monthly" here
+      // turned a weekly or daily budget into a monthly one on every edit).
       await api("/api/budgets/org", {
         method: "PUT",
-        body: { amount_cents: Math.round(parseFloat(orgInput || "0") * 100), period: "monthly" },
+        body: { amount_cents: Math.round(parseFloat(orgInput || "0") * 100), force },
       });
       push("success", "Organization budget updated.");
       setOrgInput(null);
+      setOrgForce(null);
       overview.refetch();
     } catch (cause) {
-      const message = cause instanceof Error ? cause.message : "Update failed.";
-      push("error", message);
+      const reason = cause instanceof ApiError ? budgetForceReason(cause.status, cause.message) : null;
+      if (reason && !force) {
+        setOrgForce(reason);
+      } else {
+        const message = cause instanceof Error ? cause.message : "Update failed.";
+        push("error", message);
+      }
     } finally {
       setSavingOrg(false);
     }
@@ -149,7 +160,7 @@ export function OverviewPage() {
                   <Button variant="ghost" size="sm" onClick={() => setOrgInput(null)}>
                     Cancel
                   </Button>
-                  <Button variant="primary" size="sm" loading={savingOrg} onClick={saveOrgBudget}>
+                  <Button variant="primary" size="sm" loading={savingOrg} onClick={() => saveOrgBudget()}>
                     Save
                   </Button>
                 </>
@@ -164,13 +175,13 @@ export function OverviewPage() {
                   <span className="font-semibold text-foreground">
                     {usd(org?.budget_cents)}
                   </span>{" "}
-                  per month ({org?.period}).
+                  {org?.period === "weekly" ? "per week" : org?.period === "daily" ? "per day" : "per month"}.
                 </p>
               ) : (
                 <div className="flex items-end gap-3">
                   <div className="w-44">
                     <label htmlFor="org-budget" className="mb-1.5 block text-xs font-medium text-foreground">
-                      New monthly limit (USD)
+                      New limit (USD)
                     </label>
                     <input
                       id="org-budget"
@@ -273,8 +284,9 @@ export function OverviewPage() {
         )}
         {overview.data?.unassigned_cents != null ? (
           <p className="border-t border-border-subtle px-5 py-3 text-xs text-muted">
-            {usd(overview.data.unassigned_cents)} remains unallocated
-            {overview.data.unassigned_cents < 0 ? " — department budgets exceed the organization budget" : ""}.
+            {overview.data.unassigned_cents >= 0
+              ? `${usd(overview.data.unassigned_cents)} remains unallocated.`
+              : `Department budgets add up to ${usd(-overview.data.unassigned_cents)} more than the organization budget.`}
           </p>
         ) : null}
       </Card>
@@ -328,6 +340,17 @@ export function OverviewPage() {
         open={wizardOpen}
         onClose={() => setWizardOpen(false)}
         onCompleted={() => overview.refetch()}
+      />
+
+      {/* Confirmación force del presupuesto org: bajo el gasto o bajo lo asignado a deptos */}
+      <ConfirmDialog
+        open={orgForce !== null}
+        onClose={() => setOrgForce(null)}
+        onConfirm={() => saveOrgBudget(true)}
+        loading={savingOrg}
+        title={orgForce ? BUDGET_FORCE_COPY[orgForce].title : ""}
+        message={orgForce ? BUDGET_FORCE_COPY[orgForce].message : ""}
+        confirmLabel="Force update"
       />
     </div>
   );

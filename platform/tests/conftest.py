@@ -524,6 +524,61 @@ def admin_conn(db):
     conn.close()
 
 
+@pytest.fixture
+def tenant_a_budget_state(admin_conn):
+    """Restore tenant A's budgets and budget counters EXACTLY after a test, and drop the ledger
+    rows it created (request ids starting with ``acct-``).
+
+    Budget tests spend for real (``spend.ingest_entries``: ledger row + counters) because budgets
+    read the ledger — a counter written by hand is a state production never reaches, and any
+    budget write now reseeds the counter from the ledger.
+    """
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, amount_cents, period, soft_threshold_pct, status FROM budgets "
+            "WHERE tenant_id = %s", (TENANT_A,))
+        budgets_before = cur.fetchall()
+        cur.execute(
+            "SELECT level, entity_id, period_start, period_end, spent_cents, budget_cents "
+            "FROM budget_counters WHERE tenant_id = %s", (TENANT_A,))
+        counters_before = cur.fetchall()
+    yield
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM spend_ledger WHERE tenant_id = %s AND request_id LIKE 'acct-%%'",
+            (TENANT_A,))
+        cur.execute("DELETE FROM budget_counters WHERE tenant_id = %s", (TENANT_A,))
+        for level, entity, start, end, spent, budget in counters_before:
+            cur.execute(
+                "INSERT INTO budget_counters (tenant_id, level, entity_id, period_start, "
+                "period_end, spent_cents, budget_cents) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                (TENANT_A, level, entity, start, end, spent, budget))
+        ids = [row[0] for row in budgets_before]
+        cur.execute(
+            "DELETE FROM budgets WHERE tenant_id = %s AND NOT (id = ANY(%s))", (TENANT_A, ids))
+        for budget_id, amount, period, pct, status in budgets_before:
+            cur.execute(
+                "UPDATE budgets SET amount_cents = %s, period = %s, soft_threshold_pct = %s, "
+                "status = %s WHERE id = %s", (amount, period, pct, status, budget_id))
+
+
+def ingest_spend(request_id, user_id, cost_cents, *, tenant_id=TENANT_A, model="glm-5.2",
+                 when=None):
+    """Spend exactly as production records it (ledger row + counters, one transaction)."""
+    from datetime import datetime, timezone
+
+    from app.db import get_engine
+    from app.governance.spend import RawSpend, ingest_entries
+
+    entry = RawSpend(
+        request_id=request_id, tenant_id=tenant_id, user_id=user_id, model_name=model,
+        cost_base_cents=cost_cents, tokens_in=10, tokens_out=10,
+        occurred_at=when or datetime.now(timezone.utc),
+    )
+    summary = ingest_entries(get_engine(), tenant_id, [entry])
+    assert summary["ingested"] == 1, summary
+
+
 @pytest.fixture(scope="module")
 def ledger_delta_sandbox(admin_conn, litellm_fake):
     """Sandbox de módulo para suites que escriben en el ledger compartido

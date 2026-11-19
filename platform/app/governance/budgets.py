@@ -90,6 +90,151 @@ def _spent_in_window(
     return row["spent_cents"] if row else 0
 
 
+def _monthly_spent(conn: Connection, *, level: str, entity_id: str) -> Decimal | int:
+    """This month's spend of an entity WITHOUT its own budget.
+
+    Ingestion counts every level's spend whether or not it has a budget,
+    into the monthly window by default (spend._bump_counters), so the spend
+    is known: an overview that reported 0 here showed "Used $0.00" for a
+    user who had spent dollars.
+    """
+    start, end = period_window("monthly", today())
+    return _spent_in_window(
+        conn, level=level, entity_id=entity_id,
+        period_start=start, period_end=end,
+    )
+
+
+# Which spend_ledger rows belong to a level (RLS already scopes the tenant).
+_LEDGER_SCOPE = {
+    "org": "TRUE",
+    "dept": "department_id = CAST(:e AS uuid)",
+    "user": "user_id = CAST(:e AS uuid)",
+}
+
+
+def _window_bounds(period_start: date, period_end: date) -> tuple[datetime, datetime]:
+    """Half-open UTC instants of an inclusive window of UTC dates.
+
+    Ingestion buckets an event by ``occurred_at.date()`` in UTC
+    (period_window), so the window is [start 00:00 UTC, end+1 00:00 UTC) —
+    comparing against ``period_end`` itself would drop its last day.
+    """
+    return (
+        datetime(period_start.year, period_start.month, period_start.day,
+                 tzinfo=timezone.utc),
+        datetime(period_end.year, period_end.month, period_end.day,
+                 tzinfo=timezone.utc) + timedelta(days=1),
+    )
+
+
+def _ledger_spent_in_window(
+    conn: Connection, *, level: str, entity_id: str,
+    period_start: date, period_end: date,
+) -> Decimal:
+    """Spend of the window straight from ``spend_ledger`` — the accounting
+    source of truth (ADR-014); the counters are its running total."""
+    since, until = _window_bounds(period_start, period_end)
+    row = conn.execute(
+        text(
+            "SELECT COALESCE(SUM(cost_billed_cents), 0) AS s FROM spend_ledger "
+            f"WHERE {_LEDGER_SCOPE[level]} "
+            "AND occurred_at >= :since AND occurred_at < :until"
+        ),
+        {"e": entity_id, "since": since, "until": until},
+    ).mappings().first()
+    return Decimal(row["s"])
+
+
+def _reseed_window_counter(
+    conn: Connection, *, level: str, entity_id: str, period: str,
+    amount_cents: int,
+) -> Decimal:
+    """Make the current window's counter equal the ledger and carry the
+    budget in force. Called on every budget write.
+
+    Why: ingestion only adds to the window of the period in force WHEN it
+    ingests, so a budget created today with a weekly/daily period — or a
+    period change (monthly → weekly) — started its window at 0 even when
+    the window already had spend, and the cutoff fired late. And
+    ``budget_cents`` (what the closed-period history shows) kept the value of
+    the window's first spend, e.g. $0 for a budget set later that month.
+
+    The counter key is (tenant, level, entity, period_start): a new window
+    may start on the same day as the old one (a monthly window and a daily
+    one both start on the 1st), so the row is re-pointed to this window's
+    ``period_end`` instead of assuming it is new.
+
+    Race-safe against the spend worker, whose ingestion is a ledger INSERT
+    plus this counter's UPSERT in ONE transaction: lock the counter row
+    FIRST (FOR UPDATE waits for an in-flight ingestion to commit), then sum
+    the ledger in a LATER statement, whose READ COMMITTED snapshot includes
+    that ingestion. An ingestion that starts after the lock blocks on the
+    row and adds on top of the reseeded value. Summing before locking would
+    lose the concurrent spend.
+    """
+    start, end = period_window(period, today())
+    params = {
+        "t": _tenant_id(conn), "level": level, "e": entity_id,
+        "ps": start, "pe": end, "budget": amount_cents,
+    }
+    conn.execute(
+        text(
+            "INSERT INTO budget_counters (tenant_id, level, entity_id, "
+            "period_start, period_end, spent_cents, budget_cents) "
+            "VALUES (CAST(:t AS uuid), :level, CAST(:e AS uuid), :ps, :pe, "
+            "0, :budget) "
+            "ON CONFLICT (tenant_id, level, entity_id, period_start) DO NOTHING"
+        ),
+        params,
+    )
+    conn.execute(
+        text(
+            "SELECT 1 FROM budget_counters WHERE tenant_id = CAST(:t AS uuid) "
+            "AND level = :level AND entity_id = CAST(:e AS uuid) "
+            "AND period_start = :ps FOR UPDATE"
+        ),
+        params,
+    )
+    spent = _ledger_spent_in_window(
+        conn, level=level, entity_id=entity_id,
+        period_start=start, period_end=end,
+    )
+    conn.execute(
+        text(
+            "UPDATE budget_counters SET spent_cents = :spent, "
+            "budget_cents = :budget, period_end = :pe, updated_at = now() "
+            "WHERE tenant_id = CAST(:t AS uuid) AND level = :level "
+            "AND entity_id = CAST(:e AS uuid) AND period_start = :ps"
+        ),
+        {**params, "spent": spent},
+    )
+    return spent
+
+
+def _resolve_terms(
+    conn: Connection, *, level: str, department_id: str | None,
+    user_id: str | None, period: str | None, soft_threshold_pct: int | None,
+) -> tuple[str, int]:
+    """Period and soft threshold of a budget write.
+
+    A write that omits them keeps the budget's current ones (monthly / 80 %
+    for a new budget). The console edits only the amount: with fixed
+    defaults every edit silently turned a weekly budget into a monthly one
+    and a custom threshold back into 80 %.
+    """
+    current = _budget_row(
+        conn, level=level, department_id=department_id, user_id=user_id,
+    )
+    resolved_period = period or (current["period"] if current else "monthly")
+    period_window(resolved_period, today())  # 422 on an unknown period, before any write
+    resolved_pct = (
+        soft_threshold_pct if soft_threshold_pct is not None
+        else (current["soft_threshold_pct"] if current else 80)
+    )
+    return resolved_period, resolved_pct
+
+
 def _upsert(
     conn: Connection, *, level: str,
     department_id: str | None, user_id: str | None,
@@ -118,21 +263,29 @@ def _upsert(
             {"amount": amount_cents, "period": period, "pct": soft_threshold_pct,
              "id": str(existing["id"])},
         )
-        return {"id": str(existing["id"]), "created": False}
-    inserted = conn.execute(
-        text(
-            "INSERT INTO budgets (tenant_id, level, department_id, user_id, "
-            "amount_cents, period, soft_threshold_pct) "
-            "VALUES (CAST(:t AS uuid), :level, CAST(:dept AS uuid), "
-            "CAST(:usr AS uuid), :amount, :period, :pct) RETURNING id"
-        ),
-        {
-            "t": _tenant_id(conn), "level": level, "dept": department_id,
-            "usr": user_id, "amount": amount_cents, "period": period,
-            "pct": soft_threshold_pct,
-        },
-    ).mappings().first()
-    return {"id": str(inserted["id"]), "created": True}
+        result = {"id": str(existing["id"]), "created": False}
+    else:
+        inserted = conn.execute(
+            text(
+                "INSERT INTO budgets (tenant_id, level, department_id, user_id, "
+                "amount_cents, period, soft_threshold_pct) "
+                "VALUES (CAST(:t AS uuid), :level, CAST(:dept AS uuid), "
+                "CAST(:usr AS uuid), :amount, :period, :pct) RETURNING id"
+            ),
+            {
+                "t": _tenant_id(conn), "level": level, "dept": department_id,
+                "usr": user_id, "amount": amount_cents, "period": period,
+                "pct": soft_threshold_pct,
+            },
+        ).mappings().first()
+        result = {"id": str(inserted["id"]), "created": True}
+    _reseed_window_counter(
+        conn, level=level,
+        entity_id=user_id or department_id or _tenant_id(conn),
+        period=period, amount_cents=amount_cents,
+    )
+    result["soft_threshold_pct"] = soft_threshold_pct
+    return result
 
 
 def _tenant_id(conn: Connection) -> str:
@@ -162,10 +315,16 @@ def _check_force_below_spend(
     department_id: str | None, user_id: str | None,
     amount_cents: int, period: str, force: bool,
 ) -> None:
-    """REQ-BUD-013: lowering below current-window spend needs force=true."""
+    """REQ-BUD-013: lowering below current-window spend needs force=true.
+
+    The spend comes from the ledger, not the counter: with a new period the
+    counter of the new window does not exist yet (it is reseeded right after
+    this check), and reading it as 0 waved through a budget already below
+    what the window had spent.
+    """
     entity = user_id or department_id or _tenant_id(conn)
     start, end = period_window(period, today())
-    spent = _spent_in_window(
+    spent = _ledger_spent_in_window(
         conn, level=level, entity_id=entity,
         period_start=start, period_end=end,
     )
@@ -187,13 +346,59 @@ def _check_force_below_spend(
         )
 
 
+def _check_force_below_allocations(
+    conn: Connection, principal: Principal, *, level: str, department_id: str | None,
+    amount_cents: int, allocated_cents, force: bool, children: str, parent: str, remedy: str,
+) -> None:
+    """A parent budget below what it already handed out to the level below (departments of the
+    organization, people of a department) leaves them over-allocated. Like a budget below the
+    spend it is the admin's call — an emergency cut must stay possible — so it needs force=true
+    and is audited as budget.forced_below_allocations; the parent's own limit still applies
+    first at enforcement."""
+    if amount_cents >= allocated_cents:
+        return
+    if not force:
+        raise validation_failed(
+            f"{children} add up to {allocated_cents} cents, "
+            f"{allocated_cents - amount_cents} cents more than the new {parent} "
+            f"({amount_cents} cents). {remedy}, or pass force=true to confirm "
+            "(the decision is audited)."
+        )
+    audit.emit(
+        conn, tenant_id=principal.tenant_id,
+        actor_role=_actor_role(principal),
+        action="budget.forced_below_allocations", actor_id=principal.user_id,
+        target_type="budget", target_id=level,
+        payload={"level": level, "department_id": department_id,
+                 "amount_cents": amount_cents,
+                 "allocated_cents": int(allocated_cents)},
+    )
+
+
 # --- Public API ----------------------------------------------------------------
 
 def set_org_budget(
     conn: Connection, principal: Principal, *,
-    amount_cents: int, period: str = "monthly",
-    soft_threshold_pct: int = 80, force: bool = False,
+    amount_cents: int, period: str | None = None,
+    soft_threshold_pct: int | None = None, force: bool = False,
 ) -> dict:
+    period, soft_threshold_pct = _resolve_terms(
+        conn, level="org", department_id=None, user_id=None,
+        period=period, soft_threshold_pct=soft_threshold_pct,
+    )
+    # REQ-BUD-002 seen from above: the organization budget may drop below what is already
+    # allocated to departments only with force=true (audited as budget.forced_below_allocations);
+    # set_dept_budget checks the same invariant from below, without that escape.
+    allocated = conn.execute(
+        text("SELECT COALESCE(SUM(amount_cents), 0) AS s FROM budgets "
+             "WHERE level = 'dept' AND status = 'active'")
+    ).mappings().first()["s"]
+    _check_force_below_allocations(
+        conn, principal, level="org", department_id=None,
+        amount_cents=amount_cents, allocated_cents=allocated, force=force,
+        children="Department budgets", parent="organization budget",
+        remedy="Lower the department budgets first",
+    )
     _check_force_below_spend(
         conn, principal, level="org", department_id=None, user_id=None,
         amount_cents=amount_cents, period=period, force=force,
@@ -211,8 +416,8 @@ def set_org_budget(
 
 def set_dept_budget(
     conn: Connection, principal: Principal, *,
-    department_id: str, amount_cents: int, period: str = "monthly",
-    soft_threshold_pct: int = 80, force: bool = False,
+    department_id: str, amount_cents: int, period: str | None = None,
+    soft_threshold_pct: int | None = None, force: bool = False,
 ) -> dict:
     dept = conn.execute(
         text("SELECT id FROM departments WHERE id = CAST(:d AS uuid)"),
@@ -220,6 +425,10 @@ def set_dept_budget(
     ).mappings().first()
     if dept is None:
         raise not_found("Department not found.")
+    period, soft_threshold_pct = _resolve_terms(
+        conn, level="dept", department_id=department_id, user_id=None,
+        period=period, soft_threshold_pct=soft_threshold_pct,
+    )
     org = _budget_row(conn, level="org")
     if org is None:
         raise validation_failed(
@@ -239,6 +448,21 @@ def set_dept_budget(
             f"{excess} cents (Σ departments = {total - old_amount + amount_cents}"
             f" > org = {org['amount_cents']})."
         )
+    # REQ-BUD-003 seen from above: the department budget may drop below what is already
+    # allocated to its people only with force=true (audited); set_user_budget checks the same
+    # invariant from below.
+    allocated = conn.execute(
+        text("SELECT COALESCE(SUM(amount_cents), 0) AS s FROM budgets "
+             "WHERE level = 'user' AND status = 'active' "
+             "AND department_id = CAST(:d AS uuid)"),
+        {"d": department_id},
+    ).mappings().first()["s"]
+    _check_force_below_allocations(
+        conn, principal, level="dept", department_id=department_id,
+        amount_cents=amount_cents, allocated_cents=allocated, force=force,
+        children="User budgets of the department", parent="department budget",
+        remedy="Lower those user budgets first",
+    )
     _check_force_below_spend(
         conn, principal, level="dept", department_id=department_id,
         user_id=None, amount_cents=amount_cents, period=period, force=force,
@@ -257,8 +481,8 @@ def set_dept_budget(
 
 def set_user_budget(
     conn: Connection, principal: Principal, *,
-    user_id: str, amount_cents: int, period: str = "monthly",
-    soft_threshold_pct: int = 80, force: bool = False,
+    user_id: str, amount_cents: int, period: str | None = None,
+    soft_threshold_pct: int | None = None, force: bool = False,
 ) -> dict:
     user = conn.execute(
         text("SELECT id, department_id FROM users WHERE id = CAST(:u AS uuid)"),
@@ -270,6 +494,10 @@ def set_user_budget(
         raise validation_failed("The user has no department; user budgets "
                                 "are scoped to a department.")
     dept_id = str(user["department_id"])
+    period, soft_threshold_pct = _resolve_terms(
+        conn, level="user", department_id=dept_id, user_id=user_id,
+        period=period, soft_threshold_pct=soft_threshold_pct,
+    )
     dept = _budget_row(conn, level="dept", department_id=dept_id)
     if dept is None:
         raise validation_failed(
@@ -443,13 +671,16 @@ def overview(conn: Connection, tenant_id: str) -> dict:
                 period_start=b_start, period_end=b_end,
             )
         else:
-            b_spent = 0
+            # No own budget: still show what the user spent this month (the
+            # dept/org budgets that DO apply count it).
+            b_spent = _monthly_spent(conn, level="user", entity_id=uid)
         users_by_dept.setdefault(str(u["department_id"]), []).append({
             "user_id": uid,
             "email": u["email"],
             "display_name": u["display_name"],
             # null until PUT /api/budgets/user/{id} assigns one.
             "budget_cents": b["amount_cents"] if b is not None else None,
+            "period": b["period"] if b is not None else None,
             "spent_cents": b_spent,
         })
     departments = []
@@ -463,7 +694,9 @@ def overview(conn: Connection, tenant_id: str) -> dict:
                 conn, level="dept", entity_id=str(r["department_id"]),
                 period_start=start, period_end=end,
             )
-            if r["amount_cents"] is not None else 0
+            if r["amount_cents"] is not None
+            else _monthly_spent(conn, level="dept",
+                                entity_id=str(r["department_id"]))
         )
         dept_id = str(r["department_id"])
         dept_users = users_by_dept.get(dept_id, [])
@@ -471,6 +704,7 @@ def overview(conn: Connection, tenant_id: str) -> dict:
             "department_id": dept_id,
             "name": r["name"],
             "budget_cents": r["amount_cents"],
+            "period": r["period"],
             "spent_cents": spent,
             "members": len(dept_users),
             "users": dept_users,

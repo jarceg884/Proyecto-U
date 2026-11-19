@@ -532,6 +532,53 @@ def test_online_sync_is_not_reported_as_offline_grace(tag, real_api, tmp_path, m
     assert tag.PRECEDENCE_CLAUSE in ctx
 
 
+def test_stale_cutoff_wakes_the_syncer_and_is_not_asserted_to_the_model(tag, tmp_path, monkeypatch):
+    """Live pilot (2026-11-15): after the admin restored a cut-off budget the device kept its
+    "cut off" snapshot until the next 5-minute sync, and every turn told the model "spending is CUT
+    OFF" while the gateway was already answering. A turn that runs on a cut-off snapshot proves it
+    stale (the gateway refuses a cut-off key): the plugin wakes the syncer through the «Sync policy»
+    request file and tells the model access was restored. Budgets read as an employee should: no
+    own budget = "no limit"; a budget lowered below its spend = $0.00, never negative."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    snapshot = {
+        "mode": "normal", "reason": "", "last_sync_at": time.time(), "last_sync_error": None,
+        "grace_remaining_seconds": 3600,
+        "bundle": {
+            "policy_version": 38, "approved_models": ["m"], "allowed_tools": [],
+            "budget": {
+                "user": {"remaining_cents": None, "cutoff": False},
+                "dept": {"remaining_cents": -90, "cutoff": True},
+                "org": {"remaining_cents": 710.195, "cutoff": False},
+            },
+        },
+    }
+
+    class _State:
+        def snapshot(self):
+            return snapshot
+
+    monkeypatch.setattr(tag.state, "get_state", lambda: _State())
+    monkeypatch.setattr(tag, "_last_stale_cutoff_sync", float("-inf"))
+    assert tag.bundle_client.sync_requested_at() == 0.0
+
+    ctx = tag._on_pre_llm_call()["context"]
+    assert "user: no limit, dept: $0.00 (CUTOFF), org: $7.10 (ok)" in ctx
+    assert "reached the model, so access has been restored" in ctx
+    assert "spending is CUT OFF at" not in ctx  # what the model used to repeat to the user
+    requested = tag.bundle_client.sync_requested_at()
+    assert requested > 0
+
+    # One request per minute, not one per turn.
+    tag._on_pre_llm_call()
+    assert tag.bundle_client.sync_requested_at() == requested
+
+    # A normal snapshot asks for nothing.
+    snapshot["bundle"]["budget"]["dept"] = {"remaining_cents": 710, "cutoff": False}
+    monkeypatch.setattr(tag, "_last_stale_cutoff_sync", float("-inf"))
+    assert "restored" not in tag._on_pre_llm_call()["context"]
+    assert tag.bundle_client.sync_requested_at() == requested
+
+
 def test_system_prompt_section_within_limit(tag, real_api, tmp_path, monkeypatch, pinned_pubkey_file):
     """REQ-GOH-007: la sección declara identidad gobernada + precedencia y
     respeta el límite de 4000 chars del core."""

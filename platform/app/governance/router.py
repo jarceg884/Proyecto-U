@@ -21,8 +21,10 @@ router = APIRouter(prefix="/api", dependencies=[Depends(require_mfa)])
 
 class BudgetBody(BaseModel):
     amount_cents: int
-    period: str = "monthly"
-    soft_threshold_pct: int = 80
+    # Omitted = keep the budget's current period/threshold (monthly / 80 %
+    # for a new budget): an amount-only edit must not reset them.
+    period: str | None = None
+    soft_threshold_pct: int | None = None
     force: bool = False
 
 
