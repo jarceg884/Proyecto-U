@@ -10,7 +10,8 @@ export TRUST_DATABASE_URL="postgresql+psycopg://trust_app:trust_app_dev@127.0.0.
 export TRUST_DATABASE_MIGRATOR_URL="postgresql+psycopg://trust_migrator:trust_migrator_dev@127.0.0.1:55432/$DB"
 export TRUST_IDP_BASE_URLS="http://127.0.0.1:8080"
 export TRUST_PROVIDER_TOKEN="${TRUST_PROVIDER_TOKEN:-live-provider-token}"  # dev default; en despliegue real viene del .env
-export TRUST_KEYCLOAK_ADMIN_PASSWORD="KeycloakDemo2026"
+KC_ADMIN_PASSWORD="${KC_ADMIN_PASSWORD:-$(grep -m1 '^KC_ADMIN_PASSWORD=' /root/trust-agent/.env 2>/dev/null | cut -d= -f2-)}"
+export TRUST_KEYCLOAK_ADMIN_PASSWORD="$KC_ADMIN_PASSWORD"  # local Keycloak admin: never hardcoded (public repo)
 export TRUST_DEVICE_TOKEN_SECRET="live-dev-secret"
 export TRUST_VAULT_KEK_B64="$(printf 'A%.0s' {1..43} | base64 -w0)"
 
@@ -23,7 +24,7 @@ c = psycopg.connect("host=127.0.0.1 port=55432 user=postgres password=trustlocal
 c.execute("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='trust_agent_dev' AND pid <> pg_backend_pid()")
 c.execute("DROP DATABASE IF EXISTS trust_agent_dev")
 PY
-  TRUST_KEYCLOAK_ADMIN_PASSWORD=KeycloakDemo2026 .venv/bin/python - <<'PY' 2>/dev/null || true
+  .venv/bin/python - <<'PY' 2>/dev/null || true
 from app.tenants.keycloak_admin import KeycloakAdminClient
 from app.config import get_settings
 kc = KeycloakAdminClient(get_settings())

@@ -26,6 +26,7 @@ import type {
   WhoAmI,
 } from "@/lib/types";
 import { centsToInput, usd, usdToCents, usagePct } from "@/lib/format";
+import { BUDGET_FORCE_COPY, budgetForceReason, type BudgetForceReason } from "@/lib/budget-force";
 import {
   Badge,
   Button,
@@ -50,6 +51,20 @@ interface EditTarget {
   currentCents: number | null;
 }
 
+/** "Monthly limit" / "Weekly limit" / "Daily limit" — the org budget's own period. */
+function periodLimitLabel(period: string | null | undefined): string {
+  if (period === "weekly") return "Weekly limit";
+  if (period === "daily") return "Daily limit";
+  return "Monthly limit";
+}
+
+/** " / week" or " / day" after a limit; monthly (the default) says nothing. */
+function periodSuffix(period: string | null | undefined): string {
+  if (period === "weekly") return " / week";
+  if (period === "daily") return " / day";
+  return "";
+}
+
 export function BudgetsPage() {
   const overview = useApi<BudgetOverview>("/api/budgets/overview");
   const mine = useApi<BudgetStatus>("/api/budgets/me");
@@ -67,13 +82,13 @@ export function BudgetsPage() {
 
   const [edit, setEdit] = useState<EditTarget | null>(null);
   const [amount, setAmount] = useState("");
-  const [forceOpen, setForceOpen] = useState(false);
+  const [forceReason, setForceReason] = useState<BudgetForceReason | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
   function openEdit(target: EditTarget) {
     setEdit(target);
     setAmount(centsToInput(target.currentCents));
-    setForceOpen(false);
+    setForceReason(null);
   }
 
   async function submit(force: boolean) {
@@ -91,18 +106,24 @@ export function BudgetsPage() {
           : edit.kind === "dept"
             ? `/api/budgets/dept/${edit.departmentId}`
             : `/api/budgets/user/${edit.userId}`;
+      // Amount only: the API keeps the budget's current period and soft
+      // threshold when they are omitted (a fixed "monthly" here turned every
+      // weekly budget back into a monthly one on each edit).
       await api(path, {
         method: "PUT",
-        body: { amount_cents: cents, period: "monthly", force },
+        body: { amount_cents: cents, force },
       });
       push("success", `${edit.name} budget updated.`);
       setEdit(null);
+      setForceReason(null);
       overview.refetch();
       mine.refetch();
     } catch (cause) {
       if (cause instanceof ApiError) {
-        if (cause.status === 422 && /below.*spend|force/i.test(cause.message)) {
-          setForceOpen(true);
+        // Below the spend or below what is already allocated: the admin confirms (audited).
+        const reason = budgetForceReason(cause.status, cause.message);
+        if (reason) {
+          setForceReason(reason);
         } else {
           push("error", cause.message);
         }
@@ -163,7 +184,7 @@ export function BudgetsPage() {
             <div className="flex flex-wrap items-end justify-between gap-3">
               <div>
                 <p className="text-[11px] font-medium uppercase tracking-wide text-muted">
-                  Monthly limit
+                  {periodLimitLabel(org?.period)}
                 </p>
                 <p className="mt-0.5 text-3xl font-semibold tracking-tight text-foreground">
                   {usd(org?.budget_cents)}
@@ -190,7 +211,9 @@ export function BudgetsPage() {
               {usd(overview.data?.dept_budgets_total_cents ?? 0)} allocated to
               departments
               {overview.data?.unassigned_cents != null
-                ? ` · ${usd(overview.data.unassigned_cents)} unallocated`
+                ? overview.data.unassigned_cents >= 0
+                  ? ` · ${usd(overview.data.unassigned_cents)} unallocated`
+                  : ` · ${usd(-overview.data.unassigned_cents)} more than this limit`
                 : ""}
               . Department budgets must sum within this limit — raise it here
               to make room for more.
@@ -236,6 +259,7 @@ export function BudgetsPage() {
                     <div className="flex items-center gap-4">
                       <p className="text-sm text-muted">
                         Limit <span className="font-semibold text-foreground">{usd(d.budget_cents)}</span>
+                        {periodSuffix(d.period)}
                       </p>
                       <p className="text-sm text-muted">
                         Used <span className="font-semibold text-foreground">{usd(d.spent_cents)}</span>
@@ -274,6 +298,7 @@ export function BudgetsPage() {
                           <div className="flex items-center gap-4">
                             <p className="text-sm text-muted">
                               Limit <span className="font-semibold text-foreground">{usd(u.budget_cents)}</span>
+                              {periodSuffix(u.period)}
                             </p>
                             <p className="text-sm text-muted">
                               Used <span className="font-semibold text-foreground">{usd(u.spent_cents)}</span>
@@ -309,8 +334,9 @@ export function BudgetsPage() {
                   {/* Σ usuarios vs depto — espejo del Σ deptos vs org */}
                   {d.budget_cents != null ? (
                     <p className="mt-2 text-xs text-muted">
-                      {usd(d.budget_cents - d.user_budgets_total_cents)} of the
-                      department budget remains unallocated —{" "}
+                      {d.budget_cents - d.user_budgets_total_cents >= 0
+                        ? `${usd(d.budget_cents - d.user_budgets_total_cents)} of the department budget remains unallocated — `
+                        : `User budgets add up to ${usd(d.user_budgets_total_cents - d.budget_cents)} more than the department budget — `}
                       {usd(d.user_budgets_total_cents)} assigned to users.
                     </p>
                   ) : null}
@@ -472,15 +498,14 @@ export function BudgetsPage() {
         </Field>
       </Dialog>
 
-      {/* Confirmación force (422 real del control plane) */}
+      {/* Confirmación force (422 real del control plane): bajo el gasto o bajo lo asignado */}
       <Dialog
-        open={forceOpen}
-        onClose={() => setForceOpen(false)}
-        title="Set budget below current spend?"
-        description="The control plane rejects budgets below the spend already recorded unless you force it."
+        open={forceReason !== null}
+        onClose={() => setForceReason(null)}
+        title={forceReason ? BUDGET_FORCE_COPY[forceReason].title : ""}
         footer={
           <>
-            <Button variant="ghost" size="sm" onClick={() => setForceOpen(false)}>
+            <Button variant="ghost" size="sm" onClick={() => setForceReason(null)}>
               Cancel
             </Button>
             <Button variant="danger" size="sm" loading={submitting} onClick={() => submit(true)}>
@@ -490,8 +515,7 @@ export function BudgetsPage() {
         }
       >
         <p className="text-sm leading-relaxed text-muted">
-          Forcing a budget below the current spend can trigger an immediate
-          cutoff at this level. This action is recorded in the audit log.
+          {forceReason ? BUDGET_FORCE_COPY[forceReason].message : ""}
         </p>
       </Dialog>
     </div>

@@ -54,7 +54,23 @@ CLIENT_ID = "trust-agent-web"
 # el flujo real de desktop. Retirado el demo :9090 (t_b8769ecb).
 REDIRECT_URI = "http://127.0.0.1:8765/callback"
 PROVIDER_TOKEN = "test-provider-token"
-KC_ADMIN_PASSWORD = "KeycloakDemo2026"
+def _local_kc_admin_password() -> str:
+    """Keycloak master admin password of the LOCAL stack: $KC_ADMIN_PASSWORD, else the repo's
+    gitignored .env (the variable docker-compose passes to Keycloak and the API). Never hardcode
+    it: this repository is public."""
+    import os
+    from pathlib import Path
+
+    value = os.environ.get("KC_ADMIN_PASSWORD", "")
+    env_file = Path(__file__).resolve().parents[2] / ".env"
+    if not value and env_file.exists():
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            if line.startswith("KC_ADMIN_PASSWORD="):
+                value = line.split("=", 1)[1].strip().strip('"').strip("'")
+    return value
+
+
+KC_ADMIN_PASSWORD = _local_kc_admin_password()
 DB_DSN = "host=127.0.0.1 port=55432 user=postgres password=trustlocal dbname=trust_agent"
 
 SLUG = "final-e2e"

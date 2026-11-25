@@ -120,6 +120,24 @@ def delete_user(
         if not remaining:
             raise conflict("Cannot delete the last organization administrator.")
 
+    # The user's model keys live at the gateway, not only in api_keys: deleting the rows
+    # alone left every key (the one each of the user's devices received at activation
+    # included) answering at LiteLLM. Block them first, fail-closed like a device
+    # revocation: a gateway failure raises and the whole delete rolls back.
+    from ..models.litellm import get_litellm
+
+    active_keys = conn.execute(
+        text(
+            "SELECT alias, litellm_key_hash FROM api_keys"
+            " WHERE user_id = CAST(:u AS uuid) AND status = 'active'"
+        ),
+        {"u": user_id},
+    ).mappings().all()
+    if active_keys:
+        litellm = get_litellm()
+        for key in active_keys:
+            litellm.block_key(key["litellm_key_hash"])
+
     cleanup = [
         "DELETE FROM spend_ledger WHERE user_id = CAST(:u AS uuid)",
         "DELETE FROM budgets WHERE user_id = CAST(:u AS uuid)",
@@ -149,7 +167,10 @@ def delete_user(
         actor_id=principal.user_id,
         target_type="user",
         target_id=user_id,
-        payload={"email": target["email"]},
+        payload={
+            "email": target["email"],
+            "keys_blocked": [key["alias"] for key in active_keys],
+        },
     )
     return None
 

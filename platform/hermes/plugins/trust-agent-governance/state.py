@@ -89,6 +89,23 @@ class GovernanceState:
             self.last_sync_error = message
         self._persist_status_file()
 
+    def mirror_from(self, snapshot: dict[str, Any]) -> bool:
+        """Adopt another copy's state as is (a follower syncer in a multiplexed gateway mirrors
+        its leader, which verified the bundle). Never persists: the leader owns the status file.
+        Returns True when something changed."""
+        mode = snapshot.get("mode")
+        bundle = snapshot.get("bundle")
+        if mode not in (MODE_NORMAL, MODE_RESTRICTED) or (mode == MODE_NORMAL and not bundle):
+            return False
+        with self._lock:
+            before = (self.mode, self.reason, self.payload, self.last_sync_at, self.last_sync_error)
+            self.mode = mode
+            self.reason = "" if mode == MODE_NORMAL else str(snapshot.get("reason") or REASON_NO_BUNDLE)
+            self.payload = dict(bundle) if bundle else None
+            self.last_sync_at = snapshot.get("last_sync_at")
+            self.last_sync_error = snapshot.get("last_sync_error")
+            return before != (self.mode, self.reason, self.payload, self.last_sync_at, self.last_sync_error)
+
     def record_veto(self, tool: str) -> None:
         with self._lock:
             self.veto_counts[tool] = self.veto_counts.get(tool, 0) + 1
@@ -145,10 +162,9 @@ class GovernanceState:
             from . import bundle_client  # local import: breaks the cycle
 
             data = self.snapshot()
-            trust_dir = bundle_client.trust_dir()
-            tmp = trust_dir / "governance_status.json.tmp"
-            tmp.write_text(_json_dumps(data), encoding="utf-8")
-            tmp.replace(trust_dir / "governance_status.json")
+            bundle_client.atomic_write_text(
+                bundle_client.trust_dir() / "governance_status.json", _json_dumps(data)
+            )
         except OSError:
             pass  # best-effort: a stale/missing status file never blocks enforcement
 

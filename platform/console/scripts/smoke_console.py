@@ -38,7 +38,23 @@ NEW_PASSWORD = "SmokeAdmin2026!"
 # Bootstrap interno admin-cli (ADR-015, patrón de la suite e2e): solo para
 # dejar el usuario de test en estado pristine antes del baile.
 KC_ADMIN_USER = "admin"
-KC_ADMIN_PASSWORD = "KeycloakDemo2026"
+def _local_kc_admin_password() -> str:
+    """Keycloak master admin password of the LOCAL stack: $KC_ADMIN_PASSWORD, else the repo's
+    gitignored .env (the variable docker-compose passes to Keycloak and the API). Never hardcode
+    it: this repository is public."""
+    import os
+    from pathlib import Path
+
+    value = os.environ.get("KC_ADMIN_PASSWORD", "")
+    env_file = Path(__file__).resolve().parents[3] / ".env"
+    if not value and env_file.exists():
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            if line.startswith("KC_ADMIN_PASSWORD="):
+                value = line.split("=", 1)[1].strip().strip('"').strip("'")
+    return value
+
+
+KC_ADMIN_PASSWORD = _local_kc_admin_password()
 
 COOKIES: dict[str, str] = {}
 

@@ -18,6 +18,7 @@ import { useApi } from "@/hooks/use-api";
 import { api, ApiError } from "@/lib/api-client";
 import type { BudgetOverview, PolicyList } from "@/lib/types";
 import { centsToInput, usd, usdToCents, usagePct } from "@/lib/format";
+import { BUDGET_FORCE_COPY, budgetForceReason, type BudgetForceReason } from "@/lib/budget-force";
 import {
   Badge,
   Button,
@@ -52,6 +53,7 @@ export function DepartmentsPage() {
   const [editName, setEditName] = useState("");
   const [amount, setAmount] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [budgetForce, setBudgetForce] = useState<BudgetForceReason | null>(null);
 
   // Alta de departamento (spec 016 D-16-01)
   const [addOpen, setAddOpen] = useState(false);
@@ -123,7 +125,7 @@ export function DepartmentsPage() {
     return cause instanceof ApiError ? cause.message : fallback;
   }
 
-  async function saveBudget() {
+  async function saveBudget(force = false) {
     if (!editId) return;
     const cents = usdToCents(amount);
     if (cents === null) {
@@ -132,15 +134,23 @@ export function DepartmentsPage() {
     }
     setSubmitting(true);
     try {
+      // Amount only: the API keeps the budget's period and threshold (a fixed "monthly" here
+      // turned a weekly or daily budget into a monthly one on every edit).
       await api(`/api/budgets/dept/${editId}`, {
         method: "PUT",
-        body: { amount_cents: cents, period: "monthly" },
+        body: { amount_cents: cents, force },
       });
       push("success", `${editName} budget updated.`);
       setEditId(null);
+      setBudgetForce(null);
       overview.refetch();
     } catch (cause) {
-      push("error", apiError(cause, "Update failed."));
+      const reason = cause instanceof ApiError ? budgetForceReason(cause.status, cause.message) : null;
+      if (reason && !force) {
+        setBudgetForce(reason);
+      } else {
+        push("error", apiError(cause, "Update failed."));
+      }
     } finally {
       setSubmitting(false);
     }
@@ -340,7 +350,9 @@ export function DepartmentsPage() {
         )}
         {overview.data?.unassigned_cents != null ? (
           <p className="border-t border-border-subtle px-5 py-3 text-xs text-muted">
-            {usd(overview.data.unassigned_cents)} of the organization budget remains unallocated.
+            {overview.data.unassigned_cents >= 0
+              ? `${usd(overview.data.unassigned_cents)} of the organization budget remains unallocated.`
+              : `Department budgets add up to ${usd(-overview.data.unassigned_cents)} more than the organization budget.`}
           </p>
         ) : null}
       </Card>
@@ -350,19 +362,19 @@ export function DepartmentsPage() {
         open={editId !== null}
         onClose={() => setEditId(null)}
         title={`Edit budget — ${editName}`}
-        description="Monthly limit in USD. The control plane rejects budgets that would push department totals above the organization budget."
+        description="Limit in USD for the budget's current period. The control plane rejects budgets that would push department totals above the organization budget."
         footer={
           <>
             <Button variant="ghost" size="sm" onClick={() => setEditId(null)}>
               Cancel
             </Button>
-            <Button variant="primary" size="sm" loading={submitting} onClick={saveBudget}>
+            <Button variant="primary" size="sm" loading={submitting} onClick={() => saveBudget()}>
               Save budget
             </Button>
           </>
         }
       >
-        <Field label="Monthly limit (USD)" htmlFor="dept-budget">
+        <Field label="Limit (USD)" htmlFor="dept-budget">
           <Input
             id="dept-budget"
             value={amount}
@@ -372,6 +384,17 @@ export function DepartmentsPage() {
           />
         </Field>
       </Dialog>
+
+      {/* Confirmación force del presupuesto del depto: bajo el gasto o bajo lo asignado */}
+      <ConfirmDialog
+        open={budgetForce !== null}
+        onClose={() => setBudgetForce(null)}
+        onConfirm={() => saveBudget(true)}
+        loading={submitting}
+        title={budgetForce ? BUDGET_FORCE_COPY[budgetForce].title : ""}
+        message={budgetForce ? BUDGET_FORCE_COPY[budgetForce].message : ""}
+        confirmLabel="Force update"
+      />
 
       {/* Alta de departamento (spec 016 D-16-01) */}
       <Dialog

@@ -19,7 +19,7 @@ import uuid
 import psycopg
 import pytest
 from tests.conftest import (
-    TENANT_A, TEST_DB, USER_CAROL, _admin, bearer_headers, mint,
+    DEPT_A1, TENANT_A, TEST_DB, USER_CAROL, _admin, bearer_headers, mint,
 )
 from tests.test_devices_flow import _enroll, _session_id
 
@@ -324,3 +324,163 @@ def test_revoke_pending_device_does_not_sweep(
     assert _key_row(admin_conn, key["key_id"])["status"] == "active"
     status, _ = litellm_fake.chat(key["key"], MODEL)
     assert status == 200, "la key del usuario sigue operativa"
+
+
+# --- Borrar un dispositivo corta igual que revocarlo (hallazgo 0.7.x) ----------
+# La key de modelo que el dispositivo recibe al activarse es del USUARIO
+# (api_keys.device_id nunca se llena): borrar la fila del device dejaba esa key
+# viva en el gateway para quien conservara el config.yaml del equipo.
+
+
+def test_delete_active_device_sweeps_like_revoke(
+    client, idp, admin_conn, litellm_fake
+):
+    fp = f"fp-delete-{uuid.uuid4().hex[:8]}"
+    carol = mint(client, idp, "carol")
+    alice = mint(client, idp, "alice")
+    _reset_carol_control_plane_state(admin_conn)
+    key = _issue_key(client, carol)
+    status, _ = litellm_fake.chat(key["key"], MODEL)
+    assert status == 200, "pre-condición: la key recién emitida invoca"
+    device_id, _token = _full_device(client, idp, fp)
+
+    resp = client.delete(f"/api/devices/{device_id}", headers=bearer_headers(alice))
+    assert resp.status_code == 204, resp.text
+
+    assert _q(admin_conn, "SELECT id FROM devices WHERE id = %s", (device_id,)) == []
+    assert _key_row(admin_conn, key["key_id"])["status"] == "blocked"
+    status, body401 = litellm_fake.chat(key["key"], MODEL)
+    assert status == 401, f"la key del device borrado debe rebotar: {status} {body401}"
+
+    deleted_ev = _audit(admin_conn, "device.deleted", device_id)
+    assert len(deleted_ev) == 1
+    sweep = deleted_ev[0]["payload"]["sweep"]
+    assert key["alias"] in [k["alias"] for k in sweep["keys_blocked"]]
+    key_ev = _audit(admin_conn, "model.key_blocked", device_id)
+    assert key["key_id"] in [e["target_id"] for e in key_ev]
+    assert all(e["payload"]["reason"] == "device_deleted" for e in key_ev)
+    chain = _q(admin_conn, "SELECT status FROM audit_verify_chain(%s)", (TENANT_A,))[0]
+    assert chain["status"] == "ok"
+
+
+def test_delete_fail_closed_when_gateway_down(
+    client, idp, admin_conn, litellm_fake, monkeypatch
+):
+    """Si el gateway no puede bloquear la key, el borrado NO se confirma:
+    503 + rollback (el device sigue ahí y activo, la key sigue activa)."""
+    from app.models.litellm import LiteLLMClient
+
+    fp = f"fp-delete-down-{uuid.uuid4().hex[:8]}"
+    carol = mint(client, idp, "carol")
+    alice = mint(client, idp, "alice")
+    key = _issue_key(client, carol)
+    device_id, _token = _full_device(client, idp, fp)
+
+    dead = LiteLLMClient("http://127.0.0.1:1", "sk-dead")  # puerto cerrado
+    monkeypatch.setattr("app.models.litellm.get_litellm", lambda: dead)
+    resp = client.delete(f"/api/devices/{device_id}", headers=bearer_headers(alice))
+    assert resp.status_code == 503, resp.text
+    assert _q(admin_conn, "SELECT status FROM devices WHERE id = %s",
+              (device_id,))[0]["status"] == "active"
+    assert _key_row(admin_conn, key["key_id"])["status"] == "active"
+    assert _audit(admin_conn, "device.deleted", device_id) == []
+
+    monkeypatch.undo()
+    resp = client.delete(f"/api/devices/{device_id}", headers=bearer_headers(alice))
+    assert resp.status_code == 204, resp.text
+    status, _ = litellm_fake.chat(key["key"], MODEL)
+    assert status == 401
+
+
+def test_delete_pending_device_does_not_sweep(
+    client, idp, admin_conn, litellm_fake
+):
+    """Un pending nunca tuvo acceso: borrarlo no mata la key del usuario,
+    que pertenece a sus OTROS dispositivos activos."""
+    fp = f"fp-delete-pending-{uuid.uuid4().hex[:8]}"
+    carol = mint(client, idp, "carol")
+    alice = mint(client, idp, "alice")
+    key = _issue_key(client, carol)
+    enrolled = _enroll(client, idp, fp).json()  # queda pending
+
+    resp = client.delete(f"/api/devices/{enrolled['device_id']}",
+                         headers=bearer_headers(alice))
+    assert resp.status_code == 204, resp.text
+    ev = _audit(admin_conn, "device.deleted", enrolled["device_id"])
+    assert ev[0]["payload"]["sweep"] == {"keys_blocked": [], "connectors_disconnected": []}
+    assert _key_row(admin_conn, key["key_id"])["status"] == "active"
+    status, _ = litellm_fake.chat(key["key"], MODEL)
+    assert status == 200, "la key del usuario sigue operativa"
+
+
+# --- Borrar un USUARIO también corta sus keys en el gateway -------------------
+# DELETE /api/users/{id} borraba las filas de api_keys y dejaba cada key viva
+# en LiteLLM (la de cada equipo del usuario incluida).
+
+
+def _throwaway_user_with_gateway_key(admin_conn):
+    from app.models.litellm import get_litellm
+
+    uid = str(uuid.uuid4())
+    admin_conn.execute(
+        "INSERT INTO users (id, tenant_id, department_id, email, display_name, "
+        "status, mfa_enrolled, oidc_subject) VALUES (%s, %s, %s, %s, %s, 'active', false, %s)",
+        (uid, TENANT_A, DEPT_A1, f"delete-me-{uid[:8]}@tenant-a.test", "Delete Me",
+         f"sub-delete-me-{uid}"),
+    )
+    alias = f"trust-{uid[:8]}-delete"
+    created = get_litellm().generate_key(
+        alias=alias, user_id=uid, models=[MODEL], max_budget_usd=None,
+        budget_duration=None, metadata={"tenant_id": TENANT_A, "user_id": uid},
+    )
+    admin_conn.execute(
+        "INSERT INTO api_keys (tenant_id, user_id, litellm_key_hash, alias, allowed_models) "
+        "VALUES (%s, %s, %s, %s, %s::jsonb)",
+        (TENANT_A, uid, created["token"], alias, f'["{MODEL}"]'),
+    )
+    return uid, alias, created["key"]
+
+
+def test_delete_user_blocks_their_model_keys_at_the_gateway(
+    client, idp, admin_conn, litellm_fake
+):
+    alice = mint(client, idp, "alice")
+    uid, alias, plaintext = _throwaway_user_with_gateway_key(admin_conn)
+    status, _ = litellm_fake.chat(plaintext, MODEL)
+    assert status == 200, "pre-condición: la key del usuario invoca"
+
+    resp = client.delete(f"/api/users/{uid}", headers=bearer_headers(alice))
+    assert resp.status_code == 204, resp.text
+
+    assert _q(admin_conn, "SELECT id FROM users WHERE id = %s", (uid,)) == []
+    status, body401 = litellm_fake.chat(plaintext, MODEL)
+    assert status == 401, f"la key del usuario borrado debe rebotar: {status} {body401}"
+    ev = _q(
+        admin_conn,
+        "SELECT payload FROM audit_log WHERE tenant_id = %s AND action = 'user.deleted' "
+        "AND target_id = %s",
+        (TENANT_A, uid),
+    )
+    assert ev and ev[0]["payload"]["keys_blocked"] == [alias]
+
+
+def test_delete_user_fail_closed_when_gateway_down(
+    client, idp, admin_conn, litellm_fake, monkeypatch
+):
+    from app.models.litellm import LiteLLMClient
+
+    alice = mint(client, idp, "alice")
+    uid, _alias, plaintext = _throwaway_user_with_gateway_key(admin_conn)
+    dead = LiteLLMClient("http://127.0.0.1:1", "sk-dead")  # puerto cerrado
+    monkeypatch.setattr("app.models.litellm.get_litellm", lambda: dead)
+    resp = client.delete(f"/api/users/{uid}", headers=bearer_headers(alice))
+    assert resp.status_code == 503, resp.text
+    assert _q(admin_conn, "SELECT id FROM users WHERE id = %s", (uid,)) != []
+    status, _ = litellm_fake.chat(plaintext, MODEL)
+    assert status == 200, "nada se confirmó: la key sigue viva"
+
+    monkeypatch.undo()
+    resp = client.delete(f"/api/users/{uid}", headers=bearer_headers(alice))
+    assert resp.status_code == 204, resp.text
+    status, _ = litellm_fake.chat(plaintext, MODEL)
+    assert status == 401

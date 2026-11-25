@@ -14,6 +14,7 @@ import base64
 import json
 import os
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -28,6 +29,25 @@ from fastapi import APIRouter, Depends
 from fastapi.testclient import TestClient
 
 PLATFORM_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _local_kc_admin_password() -> str:
+    """Keycloak master admin password of the LOCAL stack: $KC_ADMIN_PASSWORD, else the repo's
+    gitignored .env (the variable docker-compose passes to Keycloak and the API). Never hardcode
+    it: this repository is public."""
+    import os
+    from pathlib import Path
+
+    value = os.environ.get("KC_ADMIN_PASSWORD", "")
+    env_file = Path(__file__).resolve().parents[2] / ".env"
+    if not value and env_file.exists():
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            if line.startswith("KC_ADMIN_PASSWORD="):
+                value = line.split("=", 1)[1].strip().strip('"').strip("'")
+    return value
+
+
+KC_ADMIN_PASSWORD = _local_kc_admin_password()
 DB_HOST = os.environ.get("TRUST_DB_HOST", "127.0.0.1")
 DB_PORT = os.environ.get("TRUST_DB_PORT", "55432")
 ADMIN_PASSWORD = os.environ.get("TRUST_DB_ADMIN_PASSWORD", "trustlocal")
@@ -245,6 +265,8 @@ def env(idp, litellm_fake):
         PLATFORM_DIR, "hermes", "plugins",
         "trust-agent-governance",
     )
+    # Spec 045: marketplace packages go to a throw-away dir (never /opt on the host).
+    os.environ["TRUST_AGENT_PROFILES_DIR"] = tempfile.mkdtemp(prefix="trust-agent-profiles-")
     # Governance bundle signing key (spec 019 lane, t_f99e12ab): consolidated
     # with the minimal unblock fix from t_0ed22c94 — the env fixture now sets
     # the MODULE-level per-session keypair so tests can also verify bundle
@@ -262,7 +284,7 @@ def env(idp, litellm_fake):
     os.environ["TRUST_PROVIDER_OPERATOR_INITIAL_PASSWORD"] = "ProviderInitial!2026x"
     os.environ["TRUST_KEYCLOAK_ADMIN_URL"] = "http://127.0.0.1:8080"
     os.environ["TRUST_KEYCLOAK_ADMIN_USER"] = "admin"
-    os.environ["TRUST_KEYCLOAK_ADMIN_PASSWORD"] = "KeycloakDemo2026"
+    os.environ["TRUST_KEYCLOAK_ADMIN_PASSWORD"] = KC_ADMIN_PASSWORD
     from app.config import get_settings
     from app.db import reset_engine
 
@@ -500,6 +522,61 @@ def admin_conn(db):
     conn = _admin(TEST_DB)
     yield conn
     conn.close()
+
+
+@pytest.fixture
+def tenant_a_budget_state(admin_conn):
+    """Restore tenant A's budgets and budget counters EXACTLY after a test, and drop the ledger
+    rows it created (request ids starting with ``acct-``).
+
+    Budget tests spend for real (``spend.ingest_entries``: ledger row + counters) because budgets
+    read the ledger — a counter written by hand is a state production never reaches, and any
+    budget write now reseeds the counter from the ledger.
+    """
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, amount_cents, period, soft_threshold_pct, status FROM budgets "
+            "WHERE tenant_id = %s", (TENANT_A,))
+        budgets_before = cur.fetchall()
+        cur.execute(
+            "SELECT level, entity_id, period_start, period_end, spent_cents, budget_cents "
+            "FROM budget_counters WHERE tenant_id = %s", (TENANT_A,))
+        counters_before = cur.fetchall()
+    yield
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM spend_ledger WHERE tenant_id = %s AND request_id LIKE 'acct-%%'",
+            (TENANT_A,))
+        cur.execute("DELETE FROM budget_counters WHERE tenant_id = %s", (TENANT_A,))
+        for level, entity, start, end, spent, budget in counters_before:
+            cur.execute(
+                "INSERT INTO budget_counters (tenant_id, level, entity_id, period_start, "
+                "period_end, spent_cents, budget_cents) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                (TENANT_A, level, entity, start, end, spent, budget))
+        ids = [row[0] for row in budgets_before]
+        cur.execute(
+            "DELETE FROM budgets WHERE tenant_id = %s AND NOT (id = ANY(%s))", (TENANT_A, ids))
+        for budget_id, amount, period, pct, status in budgets_before:
+            cur.execute(
+                "UPDATE budgets SET amount_cents = %s, period = %s, soft_threshold_pct = %s, "
+                "status = %s WHERE id = %s", (amount, period, pct, status, budget_id))
+
+
+def ingest_spend(request_id, user_id, cost_cents, *, tenant_id=TENANT_A, model="glm-5.2",
+                 when=None):
+    """Spend exactly as production records it (ledger row + counters, one transaction)."""
+    from datetime import datetime, timezone
+
+    from app.db import get_engine
+    from app.governance.spend import RawSpend, ingest_entries
+
+    entry = RawSpend(
+        request_id=request_id, tenant_id=tenant_id, user_id=user_id, model_name=model,
+        cost_base_cents=cost_cents, tokens_in=10, tokens_out=10,
+        occurred_at=when or datetime.now(timezone.utc),
+    )
+    summary = ingest_entries(get_engine(), tenant_id, [entry])
+    assert summary["ingested"] == 1, summary
 
 
 @pytest.fixture(scope="module")

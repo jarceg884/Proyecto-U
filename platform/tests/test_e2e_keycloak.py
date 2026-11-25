@@ -22,7 +22,7 @@ import urllib.parse
 
 import pytest
 
-from tests.conftest import ADMIN_DSN, PLATFORM_DIR, TENANT_B, TEST_DB
+from tests.conftest import ADMIN_DSN, KC_ADMIN_PASSWORD, PLATFORM_DIR, TENANT_B, TEST_DB
 
 KC_HOST = "127.0.0.1"
 KC_PORT = 8080
@@ -34,7 +34,7 @@ REDIRECT_URI = "http://127.0.0.1:8765/callback"
 KC_USER = "cp-e2e-user"
 KC_PASSWORD = "CpE2ePass2026!"
 ADMIN_USER = "admin"
-ADMIN_PASSWORD = "KeycloakDemo2026"
+ADMIN_PASSWORD = KC_ADMIN_PASSWORD
 
 
 def _kc_available() -> bool:

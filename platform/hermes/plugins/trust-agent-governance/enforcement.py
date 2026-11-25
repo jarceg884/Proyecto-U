@@ -379,9 +379,21 @@ class GovernanceState:
             log_event("bundle_rejected_at_sync", reason=exc.reason)
             return None
         try:  # caché compartida con el núcleo v2 (contrato del archivo .jws)
-            tmp = _bundle_cache_path().with_suffix(".jws.tmp")
-            tmp.write_text(jws, encoding="utf-8")
-            tmp.replace(_bundle_cache_path())
+            import secrets
+            import threading
+
+            cache_path = _bundle_cache_path()
+            # Unique temp per write: the leader syncer and other plugin copies of a multiplexed
+            # gateway write this same file.
+            tmp = cache_path.with_name(
+                f".{cache_path.name}.{os.getpid()}.{threading.get_ident()}.{secrets.token_hex(4)}.tmp"
+            )
+            try:
+                tmp.write_text(jws, encoding="utf-8")
+                tmp.replace(cache_path)
+            except OSError:
+                tmp.unlink(missing_ok=True)
+                raise
             log_event(
                 "bundle_synced",
                 policy_version=payload.get("policy_version"),

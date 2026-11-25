@@ -239,7 +239,8 @@ MFA". Decisión (hallazgo QA t_db7b2fa9 / GAP-10.2, tarea t_edbcface):
    punta.
 2. **Consentimiento para operaciones Admin REST en vivo** desde el worker
    (el gate del terminal bloqueó el bootstrap de credenciales admin; el
-   proyecto ya usa el credencial de dev `KeycloakDemo2026` en `tests/e2e`).
+   proyecto ya usa la credencial de admin local en `tests/e2e`; desde 2026-11-15 se lee de
+   `KC_ADMIN_PASSWORD` del `.env`, nunca escrita en el repo).
 
 ## 7. Enmienda v1.2.0 (2026-10-27) — Descope de AC-AUTH-006 del v0.1.0-pilot
 

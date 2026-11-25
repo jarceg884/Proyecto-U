@@ -118,9 +118,10 @@ def consume_capability_findings() -> None:
     try:
         data = collect_capability_findings()
         data["warnings"] = {}
-        tmp = (bundle_client.trust_dir() / "capability-findings.json.tmp")
-        tmp.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
-        tmp.replace(bundle_client.trust_dir() / "capability-findings.json")
+        bundle_client.atomic_write_text(
+            bundle_client.trust_dir() / "capability-findings.json",
+            json.dumps(data, indent=2, default=str),
+        )
     except OSError:
         pass  # best-effort: un finding re-enviado jamás es peor que perderlo
 
@@ -128,9 +129,7 @@ def consume_capability_findings() -> None:
 def consume_veto_counts() -> None:
     """Tras una attestation EXITOSA el conteo parte de cero (REQ-GOH-012)."""
     try:
-        tmp = _veto_counts_path().with_suffix(".json.tmp")
-        tmp.write_text("{}", encoding="utf-8")
-        tmp.replace(_veto_counts_path())
+        bundle_client.atomic_write_text(_veto_counts_path(), "{}")
     except OSError:
         pass  # best-effort: un conteo re-enviado jamás es peor que perderlo
     governance_state.get_state().drain_veto_counts()

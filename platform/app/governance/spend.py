@@ -85,6 +85,9 @@ def _bump_counters(
         )
         period = budget["period"] if budget else "monthly"
         start, end = period_window(period, when.date())
+        # budget_cents follows the budget in force (the closed-period history
+        # shows it): kept from the window's FIRST spend, a budget set later
+        # in the window read as $0 there.
         conn.execute(
             text(
                 "INSERT INTO budget_counters (tenant_id, level, entity_id, "
@@ -93,7 +96,8 @@ def _bump_counters(
                 ":spent, :budget) "
                 "ON CONFLICT (tenant_id, level, entity_id, period_start) "
                 "DO UPDATE SET spent_cents = budget_counters.spent_cents "
-                "+ EXCLUDED.spent_cents, updated_at = now()"
+                "+ EXCLUDED.spent_cents, budget_cents = EXCLUDED.budget_cents, "
+                "updated_at = now()"
             ),
             {
                 "t": tenant_id, "level": level, "e": str(entity),
