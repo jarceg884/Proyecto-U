@@ -347,3 +347,8 @@ specs/                      # specs SDD del producto (specify → plan → tasks
 docs/                       # arquitectura, validación, evidencia real de cada capacidad
 skills/                     # hallazgos capturados como skills reutilizables
 ```
+
+## Licencia
+
+[MIT](LICENSE) © 2026 Jose David Arce González. Trust Agent se construye sobre
+[Hermes Agent](https://github.com/NousResearch/hermes-agent), también MIT (© Nous Research).
