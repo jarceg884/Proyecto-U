@@ -1,5 +1,26 @@
 # Trust Agent — Plataforma SaaS de gobernanza de IA sobre Hermes Agent
 
+> [!IMPORTANT]
+> **Proyecto de ejemplo, sin garantía.** Trust Agent se publica como referencia de cómo
+> gobernar agentes de IA sobre Hermes Agent, bajo la [licencia MIT](LICENSE). Se entrega
+> **"tal cual"**, sin garantía de ningún tipo, y el autor no responde por daños ni reclamos
+> derivados de su uso.
+>
+> - **Si lo clonas, lo modificas o lo usas en tu negocio, es bajo tu propia responsabilidad.**
+>   Tú respondes ante tus usuarios y clientes, y por la seguridad, los datos y los costos de
+>   tu despliegue.
+> - **No incluye credenciales ni acceso a nada del autor:** ni claves de modelos (MaaS), ni
+>   certificados de firma, ni servidores o instancias. Despliega la tuya con tus propias claves.
+> - **No incluye soporte, mantenimiento ni actualizaciones garantizadas.** Cualquier servicio
+>   (instalación, configuración, soporte u operación) requiere un acuerdo por escrito aparte.
+> - Lo que dicen este README, la documentación y las releases describe cómo funciona el
+>   proyecto; no es una promesa ni una garantía de resultados.
+>
+> *Example project provided "as is" under the MIT License, without warranty of any kind. Use it
+> at your own risk; the author is not liable for any claim or damages. See [LICENSE](LICENSE).*
+
+**Versión actual: v0.7.6.** Notas, checksums y certificado de cada versión en [Releases](../../releases).
+
 Piloto funcional **desplegable donde sea**: un `docker compose up` levanta la
 plataforma completa en cualquier host Linux con Docker — tu laptop, tu VM en
 cualquier nube (Huawei Cloud ECS, AWS, etc.) o un servidor on-prem. Sin
@@ -11,6 +32,19 @@ dependencias del proyecto de origen: solo este repo + un `.env`.
 > log inmutable) y sus usuarios finales corren agentes de Hermes Agent
 > **sujetos a esa gobernanza** (veto de políticas, corte por presupuesto,
 > revocación de dispositivos). Documentación de producto: `docs/`.
+
+**Qué incluye (v0.7.6):**
+
+- **Provider Console:** el operador aprovisiona y gestiona las organizaciones (tenants).
+- **Admin Console por organización:** usuarios, departamentos y roles; políticas (Policy
+  Studio); modelos aprobados; presupuestos jerárquicos con corte automático; dispositivos;
+  conexiones y bóveda de secretos; marketplace de perfiles de agente; auditoría.
+- **Escritorio Windows gobernado:** un solo instalador MSIX para todas las organizaciones. Se
+  activa con *Portal URL + código de organización + token de un solo uso*, toma la marca de la
+  organización y aplica su política firmada.
+- **Gateway de modelos (LiteLLM):** cada usuario recibe una clave virtual limitada a sus
+  modelos aprobados y a su presupuesto. Modelos centrales del proveedor (Huawei Cloud MaaS en
+  el piloto) o BYOK de cada organización.
 
 ---
 
@@ -31,7 +65,7 @@ corre dentro de contenedores.
 ## Instalación de UN comando
 
 ```bash
-git clone https://github.com/jarceg884/trust-agent.git
+git clone https://github.com/jarceg884/Proyecto-U.git trust-agent   # réplica pública
 cd trust-agent
 
 # Modo dev local (todo en 127.0.0.1, zero config):
@@ -207,24 +241,28 @@ dominio, y setup.sh NO deriva nada automáticamente. Fija a mano en `.env`:
 
 ### Instalador de escritorio universal (multi-organización)
 
-El repo de plataforma **no guarda el binario MSIX de ~744 MB en git**. El
+El repo de plataforma **no guarda el binario MSIX (~1.8 GB) en git**. El
 instalador se construye una vez con un bundle neutro y sirve para cualquier
 organización; el branding, portal, modelo y políticas se resuelven en la
 activación del empleado.
 
-La receta de build vive en
-`https://github.com/jarceg884/trust-agent-build` y se ejecuta con el workflow
-`Build Trust Agent Windows MSIX` (`workflow_dispatch`). Por defecto produce
+La receta de build del escritorio (Hermes Desktop + el overlay de Trust Agent)
+vive en un repositorio aparte y privado, `trust-agent-build`. Produce un
 `Trust Agent` genérico, sin `org_code` ni credenciales.
 
-Después de construir, publica el MSIX en el host de la plataforma:
+Antes de publicar, instala el MSIX en un Windows de prueba con
+`Add-AppxPackage -Stage`: Windows llegó a rechazar (`0x80070570`) paquetes de
+electron-builder que pasaban las demás verificaciones. En ese caso se
+reempaqueta desde su propio contenido con `makeappx` y se firma una sola vez.
+
+Después, publica el MSIX en el host de la plataforma:
 
 ```bash
 python3 scripts/bake_generic_desktop_bundle.py
 # Build del desktop/MSIX (ver docs/generic-installer.md)
 python3 scripts/publish_universal_installer.py \
-  --msix /ruta/TrustAgentDesktop-0.0.0-win-x64.msix \
-  --version 0.6.0
+  --msix /ruta/TrustAgentDesktop-<versión>-win-x64.msix \
+  --version <versión>          # p. ej. 0.7.6
 ```
 
 Eso deja `installer-artifacts/_universal/<version>/` y la API lo sirve
@@ -247,7 +285,8 @@ del gateway alcanzable desde la máquina del empleado (p. ej.
 se deja vacía y el base URL interno es loopback, la API deriva el host de la
 petición.
 
-Detalle completo: `docs/generic-installer.md`.
+Detalle completo: `docs/generic-installer.md` (escrito para la v0.6.0; el flujo
+de activación no cambió).
 
 ---
 
@@ -333,6 +372,7 @@ make smoke                         # verificación en cualquier momento
 ## Mapa del repo
 
 ```
+LICENSE                     # licencia MIT
 docker-compose.yml          # el stack completo (12 servicios, 2 perfiles)
 .env.example                # plantilla de entorno COMPLETA (secretos + URLs + puertos)
 Makefile                    # setup / smoke / backup / restore / litellm-up
@@ -344,11 +384,16 @@ platform/provider-console/  # Provider Console Next.js (panel del operador)
 platform/hermes/            # plugin de gobernanza + profile-template del bundle de descarga
 litellm-real/               # config del proxy LiteLLM real (catálogo + precios MaaS)
 specs/                      # specs SDD del producto (specify → plan → tasks → implement → converge)
+.specify/                   # configuración de spec-kit (flujo SDD)
 docs/                       # arquitectura, validación, evidencia real de cada capacidad
 skills/                     # hallazgos capturados como skills reutilizables
+DECISIONES.md               # visión y decisiones del producto
+CONTEXTO-TAREAS.md          # contexto compartido de las tareas de desarrollo
+auditoria/                  # auditoría AI-DLC del proyecto
 ```
 
 ## Licencia
 
-[MIT](LICENSE) © 2026 Jose David Arce González. Trust Agent se construye sobre
+[MIT](LICENSE) © 2026 Jose David Arce González. Se entrega "tal cual", sin garantía; ver el
+aviso al inicio de este README. Trust Agent se construye sobre
 [Hermes Agent](https://github.com/NousResearch/hermes-agent), también MIT (© Nous Research).
